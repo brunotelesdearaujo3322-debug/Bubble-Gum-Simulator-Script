@@ -1,0 +1,248 @@
+--[[
+	ScanEggs.lua - script SEPARADO para quando o jogo ganhar ovos/caixas novos.
+	Nao tem GUI: execute e olhe o Output (F9).
+
+	O que faz:
+	  1) Procura ovos (" Egg") e caixas (" Crate") no Workspace, no ReplicatedStorage e nos
+	     ModuleScripts de dados, e tudo que estiver em Workspace.Eggs.
+	  2) Compara com KNOWN_NAMES (os que ja estao no SettingsGui.lua) e mostra so os NOVOS,
+	     com caminho, posicao do modelo e preco.
+	  3) Copia para a area de transferencia um bloco pronto para colar no SettingsGui.lua.
+
+	Observacoes:
+	  - O jogo so carrega o que esta perto de voce (os nomes do ReplicatedStorage e dos modulos
+	    aparecem de qualquer lugar). Se algo novo nao aparecer, rode de novo no mundo certo.
+	  - Para o LUGAR onde ficar ao abrir o ovo, abra o ovo no jogo com o "Record eggs" ligado
+	    no SettingsGui (ele gera o EGG_SPOTS).
+	  - Quando adicionar ovos novos no SettingsGui.lua, acrescente os nomes aqui em KNOWN_NAMES.
+]]
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local SCAN_MODULES = true -- tambem le ModuleScripts com "egg" no nome (usa require)
+
+-- Ovos e caixas que o SettingsGui.lua ja conhece (EGG_WORLDS)
+local KNOWN_NAMES = {
+	-- Lobby
+	"Common Egg", "Crystal Egg", "Hell Egg", "Ice Shard Egg", "Lunar Egg", "Magma Egg", "Nightmare Egg", "Rainbow Egg", "Spikey Egg", "Spotted Egg", "Void Shard Egg",
+	-- Doce
+	"Basic Crate", "Classic Crate", "Dominus Egg", "Epic Crate", "Gummy Egg", "Ice Cream Egg", "Jelly Egg", "Slushy Egg", "Sparkle Crate", "Winged Crate",
+	-- Brinquedos
+	"Adurite Crate", "Bee Egg", "Block Egg", "Headphone Crate", "Rubber Egg", "Toy Egg", "Wind-up Egg",
+	-- Praia
+	"Balloon Egg", "Beach Crate", "Beach Egg", "Coconut Egg", "Crab Egg", "Sand Egg", "Water Crate", "Water Egg",
+	-- Atlantida
+	"Ancient Egg", "Coral Egg", "Darkness Egg", "Kelp Egg", "Ocean Crate", "Ocean Egg", "Underwater Crate",
+	-- ArcoIris
+	"Colorful Egg", "Fancy Egg", "Orange Egg", "Red Egg",
+	-- Submundo
+	"Dark Egg", "Evil Egg", "Fire Egg", "Obsidian Egg", "Sparkly Egg", "Stone Egg",
+	-- FlorestaMitica
+	"Mossy Egg", "Mushroom Egg", "Mythical Egg", "Pastel Egg", "Spirit Egg",
+	-- Céu
+	"Demon Crate", "Demonic Egg", "Halo Egg", "Heaven Egg",
+}
+
+local KNOWN = {}
+for _, name in ipairs(KNOWN_NAMES) do
+	KNOWN[name] = true
+end
+
+---------------------------------------------------------------------
+-- helpers
+---------------------------------------------------------------------
+local function isCrate(name)
+	return type(name) == "string" and name:find("%s[Cc][Rr][Aa][Tt][Ee]$") ~= nil
+end
+
+local function isEggOrCrate(name)
+	return type(name) == "string" and #name <= 40
+		and (name:find("%s[Ee][Gg][Gg]$") ~= nil or isCrate(name))
+end
+
+local function fmtVector(v)
+	return ("Vector3.new(%.4f, %.4f, %.4f)"):format(v.X, v.Y, v.Z)
+end
+
+local function instancePosition(inst)
+	if inst:IsA("Model") then
+		return inst:GetPivot().Position
+	elseif inst:IsA("BasePart") then
+		return inst.Position
+	end
+	return nil
+end
+
+-- primeiro texto "de preco" (150, 17,500, 2.5M...) que estiver escrito dentro do modelo
+local function priceOf(inst)
+	for _, d in ipairs(inst:GetDescendants()) do
+		if d:IsA("TextLabel") or d:IsA("TextButton") then
+			local text = d.Text:gsub("%s+", "")
+			if text:match("^[%d,%.]+[KkMmBbTt]?$") then
+				return text
+			end
+		end
+	end
+	return nil
+end
+
+---------------------------------------------------------------------
+-- scan
+---------------------------------------------------------------------
+local found = {} -- nome -> { Name, Sources, Path, Pos, Price }
+local order = {}
+
+local function register(name, source, inst)
+	local entry = found[name]
+	if not entry then
+		entry = { Name = name, Sources = {} }
+		found[name] = entry
+		table.insert(order, name)
+	end
+
+	if not table.find(entry.Sources, source) then
+		table.insert(entry.Sources, source)
+	end
+
+	-- detalhes so da primeira vez que o objeto aparece no mapa
+	if inst and not entry.Path then
+		entry.Path = inst:GetFullName()
+		entry.Pos = instancePosition(inst)
+		entry.Price = priceOf(inst)
+	end
+end
+
+-- 1) Workspace (tudo que parece ovo/caixa)
+local descendants = workspace:GetDescendants()
+for i, inst in ipairs(descendants) do
+	if (inst:IsA("Model") or inst:IsA("BasePart")) and isEggOrCrate(inst.Name) then
+		register(inst.Name, "Workspace", inst)
+	end
+	if i % 4000 == 0 then
+		task.wait()
+	end
+end
+
+-- 1b) tudo que estiver em Workspace.Eggs, mesmo que o nome fuja do padrao
+local eggsFolder = workspace:FindFirstChild("Eggs")
+if eggsFolder then
+	for _, child in ipairs(eggsFolder:GetChildren()) do
+		register(child.Name, "Workspace.Eggs", child)
+	end
+end
+
+-- 2) ReplicatedStorage (nomes) e modulos de dados
+for _, inst in ipairs(ReplicatedStorage:GetDescendants()) do
+	if isEggOrCrate(inst.Name) then
+		register(inst.Name, "ReplicatedStorage")
+	end
+
+	if SCAN_MODULES and inst:IsA("ModuleScript") and inst.Name:lower():find("egg", 1, true) then
+		pcall(function()
+			local data = require(inst)
+			if type(data) ~= "table" then
+				return
+			end
+			for key, value in pairs(data) do
+				if isEggOrCrate(key) then
+					register(key, "Module " .. inst.Name)
+				end
+				if type(value) == "table" then
+					if isEggOrCrate(value.Name) then
+						register(value.Name, "Module " .. inst.Name)
+					end
+					for key2 in pairs(value) do
+						if isEggOrCrate(key2) then
+							register(key2, "Module " .. inst.Name)
+						end
+					end
+				end
+			end
+		end)
+	end
+end
+
+---------------------------------------------------------------------
+-- resultado
+---------------------------------------------------------------------
+table.sort(order)
+
+local newNames, knownFound = {}, {}
+for _, name in ipairs(order) do
+	if KNOWN[name] then
+		table.insert(knownFound, name)
+	else
+		table.insert(newNames, name)
+	end
+end
+
+local missing = {}
+for _, name in ipairs(KNOWN_NAMES) do
+	if not found[name] then
+		table.insert(missing, name)
+	end
+end
+
+print(("[ScanEggs] %d achado(s): %d ja conhecido(s), %d NOVO(S)"):format(#order, #knownFound, #newNames))
+
+if #missing > 0 then
+	print(("[ScanEggs] %d conhecido(s) nao apareceram agora (provavelmente longe/nao carregados): %s"):format(
+		#missing, table.concat(missing, ", ")
+	))
+end
+
+if #newNames == 0 then
+	print("[ScanEggs] Nenhum ovo ou caixa novo.")
+	return
+end
+
+local out = {}
+table.insert(out, "-- ScanEggs: ovos/caixas NOVOS (adicione os nomes em EGG_WORLDS, no mundo certo)")
+table.insert(out, "")
+
+for _, name in ipairs(newNames) do
+	local entry = found[name]
+	local kind = isCrate(name) and "Crate" or "Egg"
+	local details = { kind, "fonte: " .. table.concat(entry.Sources, ", ") }
+	if entry.Path then
+		table.insert(details, entry.Path)
+	end
+	if entry.Pos then
+		table.insert(details, "modelo em " .. fmtVector(entry.Pos))
+	end
+	table.insert(out, ("-- %s: %s"):format(name, table.concat(details, " | ")))
+end
+
+table.insert(out, "")
+table.insert(out, "-- nomes (para EGG_WORLDS):")
+local quoted = {}
+for _, name in ipairs(newNames) do
+	table.insert(quoted, ("%q"):format(name))
+end
+table.insert(out, table.concat(quoted, ", "))
+
+local prices = {}
+for _, name in ipairs(newNames) do
+	local price = found[name].Price
+	if price then
+		table.insert(prices, ("\t[%q] = %q, -- confira a moeda (Coins/Gems/outra)"):format(name, price))
+	end
+end
+if #prices > 0 then
+	table.insert(out, "")
+	table.insert(out, "-- precos lidos do modelo (para EGG_PRICES):")
+	for _, line in ipairs(prices) do
+		table.insert(out, line)
+	end
+end
+
+table.insert(out, "")
+table.insert(out, "-- Lugar onde ficar ao abrir: abra cada ovo novo no jogo com o Record eggs ligado (gera o EGG_SPOTS).")
+
+local text = table.concat(out, "\n")
+print(text)
+
+local clip = setclipboard or toclipboard
+if clip and pcall(clip, text) then
+	print("[ScanEggs] Resultado copiado para a area de transferencia.")
+end
