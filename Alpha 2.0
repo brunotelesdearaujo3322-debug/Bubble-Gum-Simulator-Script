@@ -1,0 +1,3491 @@
+--[[
+	SettingsGui.lua
+	LocalScript -> coloque em StarterPlayer > StarterPlayerScripts (tambem roda em executores)
+
+	GUI no estilo do print (painel azul, linhas claras, sliders/toggles verdes).
+	Abas: Autofarm | Ovos | Cliente | Teleport
+	As listas tem grupos que abrem e fecham: clique no titulo (ex.: "Atlantida")
+	para mostrar/esconder o conteudo.
+
+	Para adicionar coisas (parent = uma aba OU o .Body de um grupo):
+		local grupo = addGroup(page, "Titulo", { Open = false, Key = "id-unico" })
+		addSection(parent, "Titulo")
+		addToggle(parent, "Nome", "descricao", valorInicial, function(on) end, "chave")
+		addSlider(parent, "Nome", "descricao", min, max, valorInicial, function(v) end, passo, "chave")
+		addButton(parent, "Nome", "descricao", "Texto do botao", function() end)
+	Todos retornam um "handle" (Row, Set/Get, SetText/SetDesc/SetStyle...).
+	A "chave" (opcional) faz o toggle/slider entrar no botao "Salvar Configuracao" (Cliente > Script):
+	a configuracao e gravada em SettingsGui_<GameId>.json e carregada sozinha ao executar de novo.
+]]
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ProximityPromptService = game:GetService("ProximityPromptService")
+local TweenService = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+local TeleportService = game:GetService("TeleportService")
+local HttpService = game:GetService("HttpService")
+
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+
+---------------------------------------------------------------------
+-- CONFIG
+---------------------------------------------------------------------
+local Cfg = {
+	Title = "Settings",
+
+	DefaultWalkSpeed = 16,
+	DefaultJumpPower = 50,
+
+	-- Auto Blow Bubble
+	BlowBubbleDelay = 0.25, -- segundos entre disparos de "BlowBubble" (ajustavel no slider)
+	PauseBlowBubbleWhileCollecting = true, -- evita falso positivo na confirmacao dos baus (Coins/Gems subindo)
+
+	-- Auto Hatch: NetworkRemoteEvent:FireServer("PurchaseEgg", nomeDoOvo, HatchFlag)
+	DefaultEgg = "Common Egg",
+	HatchDelay = 1, -- segundos entre compras (ajustavel no slider)
+	HatchFlag = true, -- 3o argumento do PurchaseEgg (no replay do remote spy era true)
+	HatchGoToEgg = true, -- se o ovo tem lugar salvo, teleporta para perto antes de comprar
+	HatchGoDistance = 30, -- so teleporta se estiver mais longe que isso (studs)
+	HatchEnterWorld = true, -- se o ovo e de outro mundo, passa pelo Retorno/Portal antes
+
+	-- Egg recorder
+	EggRecorderUseHook = true, -- usa hookmetamethod (se o executor tiver) para ler o PurchaseEgg do jogo
+	EggCurrencyWait = 1.5, -- segundos esperando Coins/Gems mudarem para calcular o custo
+	EggSearchRadius = 60, -- busca barata do ovo perto de voce (studs); se falhar, varre o Workspace
+
+	-- Equipes por mundo ao coletar baus: FireServer("EquipTeam", slot)
+	AutoEquipTeams = true,
+	LobbyTeam = 2, -- Mundo Spawn / Lobby
+	DefaultWorldTeam = 3, -- Demais mundos
+	SkyWorldTeam = 4, -- Mundo Céu
+	EquipTeamDelay = 0.3, -- pausa curta apos equipar a equipe
+
+	-- Posicao inicial ao iniciar "Collect all chests"
+	ReturnToStartOnFinish = true,
+	ReturnStartDelay = 0.5,
+	EquipStartTeamOnFinish = true, -- ao voltar para a posicao inicial, equipa a equipe do mundo em que voce estava
+
+	-- AutoCollect Chest: repete a coleta sozinho quando os baus ficam prontos
+	AutoCollectMargin = 2, -- folga (s) depois do timer do proximo bau chegar a zero
+	AutoCollectMinWait = 10, -- espera minima (s) entre uma coleta e outra
+	AutoCollectMaxWait = 600, -- espera maxima (s); depois disso confere os baus de novo
+	AutoCollectRetry = 60, -- espera (s) quando nenhum timer de bau e conhecido
+
+	-- "Ovos teleportes": passa pelo Retorno/Portal ao ir para um ovo de outro mundo (igual ao Auto Hatch)
+	EggTeleportViaPortal = true,
+
+	-- Salvar Configuracao (precisa de writefile/readfile do executor)
+	AutoLoadConfig = true, -- carrega a configuracao salva ao executar o script
+	ConfigFile = "SettingsGui_%d.json", -- %d = GameId (cada jogo tem a sua)
+
+	-- Portais e retorno ao Lobby: o SERVIDOR faz o teleporte, entao o script so continua depois que o
+	-- personagem realmente chegou ao destino (confere a posicao: Lobby ou o mundo do portal).
+	PortalArriveTimeout = 15, -- segundos esperando chegar ao destino em cada tentativa
+	PortalAttempts = 3, -- tentativas (teleporta para o portal/retorno de novo se nao chegou)
+	WorldSettleDelay = 2, -- folga depois de chegar (o mapa do mundo termina de carregar); use 10 para esperar sempre 10s
+	PortalDelay = 10, -- se NAO der para confirmar a chegada: espera isso depois de entrar no Portal e confere de novo
+	ReturnDelay = 10, -- idem depois do "Retorno Lobby"
+	ReturnToStartViaPortal = true, -- ao voltar para a posicao inicial dentro de um mundo, passa pelo Lobby e pelo Portal
+
+	-- Verificacao da recompensa dos baus: depois de teleportar, espera algum valor vigiado AUMENTAR
+	-- (re-teleporte rapido: cada tentativa espera pouco e tenta de novo, sempre conferindo a coleta)
+	ChestTimeout = 1.5, -- segundos esperando a recompensa em cada tentativa
+	ChestAttempts = 5, -- tentativas por bau antes de pular para o proximo
+	ChestRetryBounce = 0.15, -- pausa entre sair do bau e voltar nele (re-dispara o toque)
+	ChestPoll = 0.05, -- de quanto em quanto tempo confere timer/recompensa
+	ChestAfterDelay = 0.2, -- folga depois de confirmar a recompensa
+	UnverifiedDelay = 2, -- espera por bau quando nao ha nenhum valor para vigiar
+	CalibrateTime = 2, -- no inicio, ignora valores que mudam sozinhos (timers, renda passiva)
+
+	-- Timers dos baus (Workspace...Chest.Regen.Info mostra "Next Chest in:\nHH:MM:SS")
+	TimerMatchXZ = 20, -- distancia horizontal maxima (studs) entre o timer e o bau da lista
+	TimerMatchY = 12, -- diferenca de altura maxima
+	PreHover = 30, -- studs acima do bau: carrega a area e le o timer ANTES de coletar
+	StreamWait = 1.5, -- segundos esperando o timer do bau carregar
+	LabelSettle = 0.3, -- folga para o texto do timer atualizar antes de ler
+
+	-- O que vigiar: numeros (IntValue/NumberValue/atributos) dentro de WatchRoots.
+	-- WatchNames vazio = vigia todos; ou liste so os que importam
+	WatchRoots = { player },
+	WatchNames = { "Coins", "Gems" },
+}
+
+local THEME = {
+	Font = Enum.Font.FredokaOne,
+	Panel = Color3.fromRGB(46, 170, 240),
+	PanelBorder = Color3.fromRGB(16, 84, 176),
+	Content = Color3.fromRGB(220, 242, 254),
+	ContentBorder = Color3.fromRGB(34, 110, 200),
+	Row = Color3.fromRGB(160, 218, 246),
+	RowBorder = Color3.fromRGB(50, 130, 205),
+	Outline = Color3.fromRGB(20, 70, 140), -- contorno dos textos
+	On = Color3.fromRGB(96, 226, 24),
+	OnBorder = Color3.fromRGB(40, 140, 20),
+	Off = Color3.fromRGB(140, 168, 190),
+	Track = Color3.fromRGB(122, 160, 178),
+	KnobBorder = Color3.fromRGB(90, 110, 130),
+	Close = Color3.fromRGB(232, 30, 64),
+	CloseBorder = Color3.fromRGB(150, 10, 40),
+	TabIdle = Color3.fromRGB(30, 118, 204),
+}
+
+local TWEEN_FAST = TweenInfo.new(0.15, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+
+---------------------------------------------------------------------
+-- DADOS
+---------------------------------------------------------------------
+local V = Vector3.new
+
+local function oc(amount)
+	return amount .. " (other currency)"
+end
+
+-- Ovos/caixas gravados pelo Egg recorder (sobrescrevem/complementam o EGG_DATA abaixo).
+-- Cole aqui o bloco copiado pelo botao "Copy egg spots".
+local EGG_SPOTS = {
+	-- ["Nome do Ovo"] = Vector3.new(x, y, z),
+}
+
+-- Por mundo: { nome, lugar onde ficar ao abrir, preco/moeda por unidade }
+-- (Ovos "Egg" e caixas "Crate" usam o mesmo remote, mas sao coisas diferentes.)
+local EGG_DATA = {
+	{ World = "Lobby", Eggs = {
+		{ "Common Egg", V(-91.6759, 45.8007, -101.4160), "150 Coins" },
+		{ "Crystal Egg", V(121.6134, 5224.3467, -316.4557), "17,500 Gems" },
+		{ "Hell Egg", V(130.4267, 32132.2480, -300.9698), "300,000 Gems" },
+		{ "Ice Shard Egg", V(-71.8872, 45.8007, -103.8595), "250 Gems" },
+		{ "Lunar Egg", V(127.7362, 5224.3467, -326.8917), "50,000 Gems" },
+		{ "Magma Egg", V(116.4126, 5224.3467, -301.8015), "2,000 Gems" },
+		{ "Nightmare Egg", V(118.9961, 32132.2480, -302.5411), "350,000 Gems" },
+		{ "Rainbow Egg", V(103.6368, 32132.2480, -299.0865), "650,000 Gems" },
+		{ "Spikey Egg", V(-59.1779, 45.8007, -103.9351), "35,000 Coins" },
+		{ "Spotted Egg", V(-81.0450, 45.8007, -103.4221), "200 Coins" },
+		{ "Void Shard Egg", V(145.0721, 32132.5078, -301.5378), "200,000 Gems" },
+	} },
+	{ World = "Doce", Eggs = {
+		{ "Basic Crate", V(-524.6708, 45.2704, -2770.4480), oc("500") },
+		{ "Classic Crate", V(-469.7605, 45.3720, -2800.5647), oc("225,000") },
+		{ "Dominus Egg", V(-541.4869, 45.4182, -2838.8828), oc("325,000") },
+		{ "Epic Crate", V(-554.1590, 45.3719, -2774.0435), oc("150,000") },
+		{ "Gummy Egg", V(-459.6257, 45.4114, -2842.4482), oc("75,000") },
+		{ "Ice Cream Egg", V(-452.2584, 45.4111, -2829.1067), oc("400") },
+		{ "Jelly Egg", V(-467.9364, 45.4114, -2866.6650), oc("300,000") },
+		{ "Slushy Egg", V(-463.1904, 45.4113, -2856.5098), oc("200,000") },
+		{ "Sparkle Crate", V(-540.9399, 45.3714, -2772.9561), oc("55,000") },
+		{ "Winged Crate", V(-567.2208, 45.3723, -2773.4028), oc("200,000") },
+	} },
+	{ World = "Brinquedos", Eggs = {
+		{ "Adurite Crate", V(-133.7750, 45.3719, -5082.8916), oc("150,000") },
+		{ "Bee Egg", V(-192.0755, 38630.8750, -5330.1953), oc("250,000") },
+		{ "Block Egg", V(-55.5168, 45.4160, -5152.3950), oc("75,000") },
+		{ "Headphone Crate", V(-120.7340, 45.3718, -5080.5786), oc("200,000") },
+		{ "Rubber Egg", V(-179.6606, 38630.8477, -5330.0137), oc("200,000") },
+		{ "Toy Egg", V(-62.1770, 45.4164, -5168.5752), oc("175,000") },
+		{ "Wind-up Egg", V(-49.9814, 45.4148, -5141.6934), oc("425") },
+	} },
+	{ World = "Praia", Eggs = {
+		{ "Balloon Egg", V(497.4865, 54.0169, -8398.3184), oc("200,000") },
+		{ "Beach Crate", V(458.3948, 53.9833, -8306.8398), oc("150,000") },
+		{ "Beach Egg", V(505.2706, 54.0143, -8387.7822), oc("150,000") },
+		{ "Coconut Egg", V(516.6935, 54.0146, -8370.2373), oc("450") },
+		{ "Crab Egg", V(405.9824, 54.0564, -8394.0059), oc("300,000") },
+		{ "Sand Egg", V(508.7654, 54.0160, -8378.2773), oc("65,000") },
+		{ "Water Crate", V(445.4434, 53.9838, -8307.4482), oc("200,000") },
+		{ "Water Egg", V(492.3329, 54.0183, -8408.2979), oc("275,000") },
+	} },
+	{ World = "Atlantida", Eggs = {
+		{ "Ancient Egg", V(338.5455, 48.5222, -12824.3818), oc("300,000") },
+		{ "Coral Egg", V(338.0160, 48.5186, -12809.0967), oc("200,000") },
+		{ "Darkness Egg", V(333.6700, 48.5164, -12794.0596), oc("150,000") },
+		{ "Kelp Egg", V(327.1133, 48.8173, -12766.2852), oc("450") },
+		{ "Ocean Crate", V(254.5436, 48.4832, -12756.8486), oc("150,000") },
+		{ "Ocean Egg", V(327.7502, 48.5152, -12780.5352), oc("65,000") },
+		{ "Underwater Crate", V(240.0138, 48.4832, -12768.3857), oc("200,000") },
+	} },
+	{ World = "ArcoIris", Eggs = {
+		{ "Colorful Egg", V(1517.0692, 19.4192, -17725.4941), oc("150,000") },
+		{ "Fancy Egg", V(1516.6559, 19.9040, -17736.1465), oc("175,000") },
+		{ "Orange Egg", V(1522.3879, 19.4161, -17712.1641), oc("65,000") },
+		{ "Red Egg", V(1524.6283, 19.4149, -17699.3398), oc("450") },
+	} },
+	{ World = "Submundo", Eggs = {
+		{ "Dark Egg", V(2190.0054, 22.7530, -20220.8691), oc("175,000") },
+		{ "Evil Egg", V(2390.9729, 22.5531, -20171.9023), oc("175,000") },
+		{ "Fire Egg", V(2402.0186, 22.5031, -20163.3340), oc("125,000") },
+		{ "Obsidian Egg", V(2415.3936, 22.5484, -20159.4922), oc("65,000") },
+		{ "Sparkly Egg", V(2185.7627, 22.7248, -20203.5312), oc("225,000") },
+		{ "Stone Egg", V(2425.6653, 22.5358, -20153.1836), oc("450") },
+	} },
+	{ World = "FlorestaMitica", Eggs = {
+		{ "Mossy Egg", V(4716.3496, 35.4915, -16076.7861), oc("550") },
+		{ "Mushroom Egg", V(4785.8530, 29918.0352, -16099.4727), oc("225,000") },
+		{ "Mythical Egg", V(4798.8389, 29918.0352, -16096.8271), oc("185,000") },
+		{ "Pastel Egg", V(4772.4043, 29918.0352, -16102.8281), oc("300,000") },
+		{ "Spirit Egg", V(4712.6792, 35.4916, -16092.2363), oc("65,000") },
+	} },
+	{ World = "Céu", Eggs = {
+		{ "Demon Crate", V(7896.9854, 41063.8398, -13877.3633), oc("200,000") },
+		{ "Demonic Egg", V(7906.1411, 41063.8398, -13861.2012), oc("300,000") },
+		{ "Halo Egg", V(7931.5527, 104.4973, -13932.0264), oc("45,000") },
+		{ "Heaven Egg", V(7920.2104, 104.8254, -13936.8643), oc("550") },
+	} },
+}
+
+-- Locais da aba Teleport, por mundo: { nome, posicao, tipo }
+-- tipo: "spawn" | "portal" (entrada do mundo) | "return" (volta ao lobby) | "chest" | "spot" (ponto comum)
+-- Mundo com portal + retorno = mundo (entra, coleta, volta). Sem os dois (Lobby) = so baus.
+local TELEPORT_RAW = {
+	{ "Lobby", {
+		{ "Spawn", V(-97.9884, 45.6762, -147.9844), "spawn" },
+		{ "Baú de moedas", V(97.9574, 907.4642, -299.9106), "chest" },
+		{ "Baú médio de gemas", V(98.1417, 21107.4180, -305.8774), "chest" },
+		{ "Baú grande de gemas", V(71.5555, 32140.4199, -323.6560), "chest" },
+	} },
+	{ "Doce", {
+		{ "Portal de doces", V(17.4070, 45.6748, -456.6841), "portal" },
+		{ "Spawn Doce", V(-503.1459, 45.2704, -2792.4331), "spawn" },
+		{ "Baú Pequeno Doce", V(-646.4275, 1931.0753, -3040.6423), "chest" },
+		{ "Baú Médio Doce", V(-650.5356, 29906.0742, -3038.5447), "chest" },
+		{ "Baú Grande Doce", V(-648.9230, 40939.0664, -3037.3198), "chest" },
+		{ "Retorno Lobby Doce", V(-485.7491, 45.2702, -2767.3418), "return" },
+	} },
+	{ "Brinquedos", {
+		{ "Portal Brinquedos", V(-19.5509, 45.6748, -489.3224), "portal" },
+		{ "Spawn Brinquedos", V(-95.6141, 45.2204, -5119.0654), "spawn" },
+		{ "Baú Pequeno Brinquedos", V(-222.4772, 1931.0750, -5348.2793), "chest" },
+		{ "Baú Médio Brinquedos", V(-217.6578, 29906.0742, -5344.9634), "chest" },
+		{ "Baú Grande Brinquedos", V(-222.3615, 38639.0703, -5349.3994), "chest" },
+		{ "Retorno Lobby Brinquedos", V(-79.8902, 45.2701, -5079.8730), "return" },
+	} },
+	{ "Praia", {
+		{ "Portal Praia", V(-14.7301, 45.6748, -537.4399), "portal" },
+		{ "Spawn Praia", V(492.6034, 53.9500, -8328.6133), "spawn" },
+		{ "Baú Pequeno Praia", V(355.8731, 1951.2817, -8553.8975), "chest" },
+		{ "Baú Médio Praia", V(354.5212, 29926.3457, -8554.4561), "chest" },
+		{ "Baú Grande Praia", V(350.9595, 40959.3672, -8553.1377), "chest" },
+		{ "Retorno Lobby Praia", V(506.5326, 53.9513, -8304.9082), "return" },
+	} },
+	{ "Atlantida", {
+		{ "Portal Atlantida", V(8.6150, 45.6748, -578.8049), "portal" },
+		{ "Spawn Atlantida", V(257.3336, 48.3471, -12782.5996), "spawn" },
+		{ "Baú Pequeno Atlantida", V(350.7777, 1951.3192, -12966.2734), "chest" },
+		{ "Baú Médio Atlantida", V(350.1304, 29926.3789, -12966.2354), "chest" },
+		{ "Baú Grande Atlantida", V(354.0816, 40959.3359, -12965.6191), "chest" },
+		{ "Retorno Lobby Atlantida", V(284.1356, 48.3471, -12747.3916), "return" },
+	} },
+	{ "ArcoIris", {
+		{ "Portal ArcoIris", V(65.1452, 45.6748, -582.5114), "portal" },
+		{ "Spawn ArcoIris", V(1475.4622, 19.2867, -17665.0801), "spawn" },
+		{ "Baú Pequeno ArcoIris", V(1340.7964, 1951.3140, -17917.0234), "chest" },
+		{ "Baú Médio ArcoIris", V(1340.7465, 29926.3633, -17912.8730), "chest" },
+		{ "Baú Grande ArcoIris", V(1340.7500, 40959.3594, -17913.8867), "chest" },
+		{ "Retorno Lobby ArcoIris", V(1495.7257, 19.2869, -17643.4004), "return" },
+	} },
+	{ "Submundo", {
+		{ "Portal Submundo", V(122.9218, 45.6748, -556.6802), "portal" },
+		{ "Spawn Submundo", V(2387.1411, 22.5812, -20133.1250), "spawn" },
+		{ "Baú Pequeno Submundo", V(2266.3162, 1951.3036, -20117.0488), "chest" },
+		{ "Baú Médio Submundo", V(2265.6392, 29926.3047, -20115.1992), "chest" },
+		{ "Baú Grande Submundo", V(2265.4368, 40959.3086, -20115.6875), "chest" },
+		{ "Retorno Lobby Submundo", V(2414.6467, 22.4911, -20132.9824), "return" },
+	} },
+	{ "FlorestaMitica", {
+		{ "Portal FlorestaMitica", V(138.7218, 45.6748, -506.0340), "portal" },
+		{ "Spawn FlorestaMitica", V(4723.9956, 35.4915, -16080.9678), "spawn" },
+		{ "Baú Pequeno FlorestaMitica", V(4764.5430, 1951.2981, -16104.6133), "chest" },
+		{ "Baú Médio FlorestaMitica", V(4742.4932, 29926.2324, -16131.6914), "chest" },
+		{ "Baú Grande FlorestaMitica", V(4760.8335, 40959.3203, -16103.4512), "chest" },
+		{ "Retorno Lobby FlorestaMitica", V(4822.0957, 43.2217, -16147.0459), "return" },
+	} },
+	{ "Céu", {
+		{ "Portal Céu", V(122.1092, 45.6748, -446.5220), "portal" },
+		{ "Spawn Céu", V(7875.0283, 91.0476, -13831.8984), "spawn" },
+		{ "Baú Pequeno Céu", V(7890.0947, 2064.1609, -13870.5771), "chest" },
+		{ "Baú Médio Céu", V(7887.7954, 27886.8418, -13869.5811), "chest" },
+		{ "Baú Grande Céu", V(7869.4097, 41072.0703, -13900.0449), "chest" },
+		{ "Retorno ao lobby Céu", V(7847.8623, 91.0474, -13839.5049), "return" },
+	} },
+	{ "Laboratório", {
+		{ "Shards Portal", V(84.2390, 55.8287, -12.8690), "portal" },
+		{ "O Laboratório", V(-1678.2826, 1855.4708, 11034.3086), "spawn" },
+		{ "Elaborar poções", V(-1739.5563, 2705.9910, 11043.5283), "spot" },
+		{ "Retornar", V(-1739.1840, 2705.9910, 11029.3994), "spot" },
+		{ "Missões", V(-1722.5101, 1855.5255, 11031.1963), "spot" },
+		{ "Retornar ao Lobby", V(-1742.7190, 1855.4706, 11101.9482), "return" },
+	} },
+}
+
+local TELEPORT_GROUPS = {}
+for _, raw in ipairs(TELEPORT_RAW) do
+	local locations = {}
+	for _, loc in ipairs(raw[2]) do
+		table.insert(locations, { Name = loc[1], Pos = loc[2], Kind = loc[3] })
+	end
+	table.insert(TELEPORT_GROUPS, { Title = raw[1], Locations = locations })
+end
+TELEPORT_RAW = nil
+
+---------------------------------------------------------------------
+-- HELPERS
+---------------------------------------------------------------------
+-- Encerra a instancia anterior se o script for executado de novo
+if _G.SettingsGuiKill then
+	pcall(_G.SettingsGuiKill)
+end
+
+-- Controle de tudo que o script cria (conexoes e threads), para o "Kill Code" encerrar tudo
+local alive = true
+local connections = {}
+local threads = {}
+
+local function connect(signal, fn)
+	local connection = signal:Connect(fn)
+	table.insert(connections, connection)
+	return connection
+end
+
+local function spawnTask(fn, ...)
+	local thread = task.spawn(fn, ...)
+	for i = #threads, 1, -1 do
+		if coroutine.status(threads[i]) == "dead" then
+			table.remove(threads, i)
+		end
+	end
+	if coroutine.status(thread) ~= "dead" then
+		table.insert(threads, thread)
+	end
+	return thread
+end
+
+local function delayTask(seconds, fn)
+	return spawnTask(function()
+		task.wait(seconds)
+		fn()
+	end)
+end
+
+local function create(className, props, children)
+	local inst = Instance.new(className)
+	local parent = props.Parent
+	for key, value in pairs(props) do
+		if key ~= "Parent" then
+			inst[key] = value
+		end
+	end
+	for _, child in ipairs(children or {}) do
+		child.Parent = inst
+	end
+	inst.Parent = parent
+	return inst
+end
+
+local function corner(radius)
+	return create("UICorner", { CornerRadius = UDim.new(0, radius) })
+end
+
+local function pill()
+	return create("UICorner", { CornerRadius = UDim.new(1, 0) })
+end
+
+-- borda (frames/botoes)
+local function border(color, thickness)
+	return create("UIStroke", {
+		Color = color,
+		Thickness = thickness,
+		ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+	})
+end
+
+-- contorno de texto
+local function textStroke(thickness, color)
+	return create("UIStroke", {
+		Color = color or THEME.Outline,
+		Thickness = thickness,
+		ApplyStrokeMode = Enum.ApplyStrokeMode.Contextual,
+		LineJoinMode = Enum.LineJoinMode.Round,
+	})
+end
+
+local function newLabel(props, strokeThickness)
+	props.BackgroundTransparency = 1
+	props.Font = THEME.Font
+	props.TextColor3 = props.TextColor3 or Color3.new(1, 1, 1)
+	return create("TextLabel", props, { textStroke(strokeThickness or 2) })
+end
+
+local function nextOrder(parent)
+	local n = (parent:GetAttribute("Count") or 0) + 1
+	parent:SetAttribute("Count", n)
+	return n
+end
+
+local function isPointer(input)
+	return input.UserInputType == Enum.UserInputType.MouseButton1
+		or input.UserInputType == Enum.UserInputType.Touch
+end
+
+local function isMotion(input)
+	return input.UserInputType == Enum.UserInputType.MouseMovement
+		or input.UserInputType == Enum.UserInputType.Touch
+end
+
+local function copyText(text)
+	local clip = setclipboard or toclipboard
+	if clip then
+		return (pcall(clip, text))
+	end
+	return false
+end
+
+-- Configuracao salva em arquivo (so funciona em executores com writefile/readfile/isfile).
+-- Controls = toggles/sliders registrados com "chave"; Data = o que foi lido do arquivo ao iniciar.
+local Settings = { Controls = {}, Data = nil }
+
+function Settings.supported()
+	return type(writefile) == "function" and type(readfile) == "function" and type(isfile) == "function"
+end
+
+function Settings.path()
+	return Cfg.ConfigFile:format(game.GameId)
+end
+
+function Settings.read()
+	if not Settings.supported() then
+		return nil
+	end
+	local ok, data = pcall(function()
+		local path = Settings.path()
+		if not isfile(path) then
+			return nil
+		end
+		return HttpService:JSONDecode(readfile(path))
+	end)
+	if ok and type(data) == "table" then
+		return data
+	end
+	return nil
+end
+
+-- ponto conhecido (da lista do Teleport) mais perto de pos: diz em que mundo voce esta
+-- retorna: local, grupo (mundo), distancia
+local function nearestSpot(pos)
+	local bestLoc, bestGroup, bestDist
+	for _, group in ipairs(TELEPORT_GROUPS) do
+		for _, loc in ipairs(group.Locations) do
+			local d = (loc.Pos - pos).Magnitude
+			if not bestDist or d < bestDist then
+				bestLoc, bestGroup, bestDist = loc, group, d
+			end
+		end
+	end
+	return bestLoc, bestGroup, bestDist
+end
+
+local function noop() end
+
+-- Em que mundo uma posicao esta ("Lobby", "Doce", ...)? Compara so X e Z (os baus do Lobby ficam a milhares
+-- de studs de altura) com os pontos conhecidos. Os portais ficam fisicamente no Lobby, entao contam como Lobby.
+local worldAnchors = {}
+for _, group in ipairs(TELEPORT_GROUPS) do
+	for _, loc in ipairs(group.Locations) do
+		table.insert(worldAnchors, {
+			World = loc.Kind == "portal" and "Lobby" or group.Title,
+			X = loc.Pos.X,
+			Z = loc.Pos.Z,
+		})
+	end
+end
+
+local function worldAt(pos)
+	local best, bestDist
+	for _, anchor in ipairs(worldAnchors) do
+		local dx, dz = anchor.X - pos.X, anchor.Z - pos.Z
+		local d = dx * dx + dz * dz
+		if not bestDist or d < bestDist then
+			best, bestDist = anchor.World, d
+		end
+	end
+	return best
+end
+
+-- ponto de um mundo pelo tipo ("portal", "return", "spawn"...)
+local function spotOf(worldTitle, kind)
+	for _, group in ipairs(TELEPORT_GROUPS) do
+		if group.Title == worldTitle then
+			for _, loc in ipairs(group.Locations) do
+				if loc.Kind == kind then
+					return loc
+				end
+			end
+		end
+	end
+	return nil
+end
+
+-- percorre os numeros vigiados (atributos + IntValue/NumberValue de Cfg.WatchRoots)
+-- fn(nome, nomeCompleto, leitor)
+local function eachNumericValue(fn)
+	for _, root in ipairs(Cfg.WatchRoots) do
+		for attrName, value in pairs(root:GetAttributes()) do
+			if type(value) == "number" then
+				fn(attrName, "attr " .. attrName, function()
+					return root:GetAttribute(attrName)
+				end)
+			end
+		end
+		for _, inst in ipairs(root:GetDescendants()) do
+			if (inst:IsA("IntValue") or inst:IsA("NumberValue")) and not inst:IsDescendantOf(playerGui) then
+				fn(inst.Name, inst:GetFullName(), function()
+					return inst.Value
+				end)
+			end
+		end
+	end
+end
+
+-- patinha decorativa do cabecalho
+local function paw(parent, x, y, size, rotation)
+	local holder = create("Frame", {
+		Name = "Paw",
+		BackgroundTransparency = 1,
+		Position = UDim2.fromScale(x, y),
+		Size = UDim2.fromOffset(size, size),
+		Rotation = rotation,
+		Parent = parent,
+	})
+	local function dot(px, py, s)
+		create("Frame", {
+			AnchorPoint = Vector2.new(0.5, 0.5),
+			Position = UDim2.fromScale(px, py),
+			Size = UDim2.fromScale(s, s),
+			BackgroundColor3 = Color3.new(1, 1, 1),
+			BackgroundTransparency = 0.82,
+			Parent = holder,
+		}, { pill() })
+	end
+	dot(0.5, 0.66, 0.5)
+	dot(0.14, 0.4, 0.22)
+	dot(0.38, 0.16, 0.22)
+	dot(0.62, 0.16, 0.22)
+	dot(0.86, 0.4, 0.22)
+end
+
+---------------------------------------------------------------------
+-- JANELA
+---------------------------------------------------------------------
+local gui = create("ScreenGui", {
+	Name = "SettingsGui",
+	ResetOnSpawn = false,
+	IgnoreGuiInset = true,
+	ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+})
+
+-- Funciona como LocalScript normal (PlayerGui) e em executores (gethui/CoreGui).
+-- Se re-executar, remove a GUI antiga antes de montar a nova.
+local function mountGui(screenGui)
+	local hidden
+	pcall(function()
+		hidden = (gethui and gethui()) or game:GetService("CoreGui")
+	end)
+
+	for _, container in ipairs({ playerGui, hidden }) do
+		local old = container and container:FindFirstChild(screenGui.Name)
+		if old then
+			old:Destroy()
+		end
+	end
+
+	if hidden and pcall(function() screenGui.Parent = hidden end) then
+		return
+	end
+	screenGui.Parent = playerGui
+end
+
+local openButton = create("TextButton", {
+	Name = "OpenButton",
+	AnchorPoint = Vector2.new(0, 0.5),
+	Position = UDim2.new(0, 12, 0.5, 0),
+	Size = UDim2.fromOffset(72, 72),
+	BackgroundColor3 = THEME.Panel,
+	Text = "Settings",
+	Font = THEME.Font,
+	TextSize = 16,
+	TextColor3 = Color3.new(1, 1, 1),
+	Parent = gui,
+}, { corner(14), border(THEME.PanelBorder, 3), textStroke(2) })
+
+local uiScale = create("UIScale", { Scale = 1 })
+
+local window = create("Frame", {
+	Name = "Window",
+	AnchorPoint = Vector2.new(0.5, 0.5),
+	Position = UDim2.fromScale(0.5, 0.5),
+	Size = UDim2.fromOffset(580, 470),
+	BackgroundColor3 = THEME.Panel,
+	Visible = false,
+	Parent = gui,
+}, { corner(18), border(THEME.PanelBorder, 4), uiScale })
+
+paw(window, 0.04, 0.01, 40, -20)
+paw(window, 0.20, 0.05, 28, 15)
+paw(window, 0.72, 0.02, 34, 20)
+paw(window, 0.60, 0.07, 24, -15)
+
+newLabel({
+	Name = "Title",
+	Text = Cfg.Title,
+	TextSize = 40,
+	Position = UDim2.fromOffset(0, 4),
+	Size = UDim2.new(1, 0, 0, 54),
+	Parent = window,
+}, 3)
+
+-- Arrastar a janela pelo cabecalho (sem deixar o cabecalho sair da tela)
+local dragBar = create("Frame", {
+	Name = "DragBar",
+	BackgroundTransparency = 1,
+	Size = UDim2.new(1, 0, 0, 58),
+	Parent = window,
+})
+
+local drag = { Active = false }
+
+dragBar.InputBegan:Connect(function(input)
+	if isPointer(input) then
+		drag.Active = true
+		drag.Start = input.Position
+		drag.StartPos = window.Position
+		input.Changed:Connect(function()
+			if input.UserInputState == Enum.UserInputState.End then
+				drag.Active = false
+			end
+		end)
+	end
+end)
+
+dragBar.InputChanged:Connect(function(input)
+	if isMotion(input) then
+		drag.Input = input
+	end
+end)
+
+connect(UserInputService.InputChanged, function(input)
+	if not (drag.Active and input == drag.Input) then
+		return
+	end
+
+	-- tudo em pixels de tela; os offsets da janela valem "scale" vezes por causa do UIScale
+	local s = uiScale.Scale
+	local viewport = gui.AbsoluteSize
+	local w, h = window.Size.X.Offset * s, window.Size.Y.Offset * s
+	local maxX = viewport.X / 2 + w / 2 - 80 -- sempre sobram 80px da janela visiveis
+	local minY = -viewport.Y / 2 + h / 2 -- o topo da janela nao sai da tela
+	local maxY = viewport.Y / 2 + h / 2 - 50
+
+	local x = math.clamp(drag.StartPos.X.Offset * s + (input.Position.X - drag.Start.X), -maxX, maxX)
+	local y = math.clamp(drag.StartPos.Y.Offset * s + (input.Position.Y - drag.Start.Y), minY, maxY)
+	window.Position = UDim2.new(drag.StartPos.X.Scale, x / s, drag.StartPos.Y.Scale, y / s)
+end)
+
+local closeButton = create("TextButton", {
+	Name = "Close",
+	AnchorPoint = Vector2.new(1, 0),
+	Position = UDim2.new(1, -12, 0, 10),
+	Size = UDim2.fromOffset(46, 46),
+	BackgroundColor3 = THEME.Close,
+	Text = "X",
+	Font = THEME.Font,
+	TextSize = 34,
+	TextColor3 = Color3.new(1, 1, 1),
+	Parent = window,
+}, { corner(10), border(THEME.CloseBorder, 3), textStroke(3, THEME.CloseBorder) })
+
+local tabBar = create("Frame", {
+	Name = "Tabs",
+	BackgroundTransparency = 1,
+	Position = UDim2.fromOffset(14, 62),
+	Size = UDim2.new(1, -28, 0, 40),
+	Parent = window,
+}, {
+	create("UIListLayout", {
+		FillDirection = Enum.FillDirection.Horizontal,
+		HorizontalAlignment = Enum.HorizontalAlignment.Center,
+		VerticalAlignment = Enum.VerticalAlignment.Center,
+		Padding = UDim.new(0, 10),
+		SortOrder = Enum.SortOrder.LayoutOrder,
+	}),
+})
+
+local content = create("Frame", {
+	Name = "Content",
+	Position = UDim2.fromOffset(14, 108),
+	Size = UDim2.new(1, -28, 1, -122),
+	BackgroundColor3 = THEME.Content,
+	ClipsDescendants = true,
+	Parent = window,
+}, { corner(12), border(THEME.ContentBorder, 3) })
+
+---------------------------------------------------------------------
+-- ABAS
+---------------------------------------------------------------------
+local tabs = {}
+local tabCount = 0
+
+local function selectTab(name)
+	for tabName, tab in pairs(tabs) do
+		local active = tabName == name
+		tab.Page.Visible = active
+		TweenService:Create(tab.Button, TWEEN_FAST, {
+			BackgroundColor3 = active and THEME.On or THEME.TabIdle,
+		}):Play()
+		tab.Border.Color = active and THEME.OnBorder or THEME.PanelBorder
+	end
+end
+
+local function newTab(name)
+	tabCount += 1
+
+	local buttonBorder = border(THEME.PanelBorder, 3)
+	local button = create("TextButton", {
+		Name = "Tab_" .. name,
+		Size = UDim2.fromOffset(125, 36),
+		BackgroundColor3 = THEME.TabIdle,
+		AutoButtonColor = false,
+		Text = name,
+		Font = THEME.Font,
+		TextSize = 22,
+		TextColor3 = Color3.new(1, 1, 1),
+		LayoutOrder = tabCount,
+		Parent = tabBar,
+	}, { corner(10), textStroke(2), buttonBorder })
+
+	local page = create("ScrollingFrame", {
+		Name = "Page_" .. name,
+		Size = UDim2.fromScale(1, 1),
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		ScrollBarThickness = 6,
+		ScrollBarImageColor3 = THEME.RowBorder,
+		CanvasSize = UDim2.new(),
+		AutomaticCanvasSize = Enum.AutomaticSize.Y,
+		ScrollingDirection = Enum.ScrollingDirection.Y,
+		Visible = false,
+		Parent = content,
+	}, {
+		create("UIListLayout", {
+			Padding = UDim.new(0, 8),
+			SortOrder = Enum.SortOrder.LayoutOrder,
+		}),
+		create("UIPadding", {
+			PaddingTop = UDim.new(0, 10),
+			PaddingBottom = UDim.new(0, 10),
+			PaddingLeft = UDim.new(0, 10),
+			PaddingRight = UDim.new(0, 14),
+		}),
+	})
+
+	tabs[name] = { Button = button, Page = page, Border = buttonBorder }
+	button.Activated:Connect(function()
+		selectTab(name)
+	end)
+
+	return page
+end
+
+---------------------------------------------------------------------
+-- COMPONENTES
+-- "parent" pode ser uma aba (newTab) ou o .Body de um grupo (addGroup)
+---------------------------------------------------------------------
+local function setRowDesc(row, text)
+	local desc = row:FindFirstChild("Desc")
+	if desc then
+		desc.Text = text
+	end
+end
+
+local function addSection(parent, text)
+	return newLabel({
+		Name = "Section_" .. text,
+		Text = text,
+		TextSize = 24,
+		Size = UDim2.new(1, 0, 0, 30),
+		LayoutOrder = nextOrder(parent),
+		Parent = parent,
+	}, 2)
+end
+
+-- linha base (titulo + descricao); "reserve" = espaco a direita para o controle
+local function baseRow(parent, name, desc, reserve)
+	local hasDesc = desc ~= nil and desc ~= ""
+
+	local row = create("Frame", {
+		Name = "Row_" .. name,
+		Size = UDim2.new(1, 0, 0, hasDesc and 60 or 50),
+		BackgroundColor3 = THEME.Row,
+		LayoutOrder = nextOrder(parent),
+		Parent = parent,
+	}, { corner(8), border(THEME.RowBorder, 2) })
+
+	newLabel({
+		Name = "Title",
+		Text = name,
+		TextSize = 22,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+		Position = UDim2.fromOffset(12, hasDesc and 4 or 0),
+		Size = hasDesc and UDim2.new(1, -reserve, 0, 28) or UDim2.new(1, -reserve, 1, 0),
+		Parent = row,
+	}, 2)
+
+	if hasDesc then
+		newLabel({
+			Name = "Desc",
+			Text = desc,
+			TextSize = 15,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			TextTruncate = Enum.TextTruncate.AtEnd,
+			Position = UDim2.fromOffset(12, 32),
+			Size = UDim2.new(1, -reserve, 0, 20),
+			Parent = row,
+		}, 1.5)
+	end
+
+	return row
+end
+
+-- GRUPO QUE ABRE E FECHA --------------------------------------------
+-- Cabecalho clicavel + corpo (.Body) onde ficam os componentes.
+-- opts.Open = comeca aberto?  opts.Key = id para lembrar o estado quando a lista e recriada
+local groupOpenState = {} -- chave -> aberto?
+local pageGroups = {} -- parent -> lista de grupos (para "Expandir/Recolher tudo")
+
+-- configuracao salva: restaura quais grupos estavam abertos (antes de criar qualquer grupo)
+Settings.Data = Cfg.AutoLoadConfig and Settings.read() or nil
+if Settings.Data and type(Settings.Data.Groups) == "table" then
+	for key, open in pairs(Settings.Data.Groups) do
+		if type(open) == "boolean" then
+			groupOpenState[key] = open
+		end
+	end
+end
+
+local function addGroup(parent, title, opts)
+	opts = opts or {}
+	local key = opts.Key or (parent.Name .. "/" .. title)
+	local open = groupOpenState[key]
+	if open == nil then
+		open = opts.Open == true
+	end
+	groupOpenState[key] = open
+
+	local holder = create("Frame", {
+		Name = "Group_" .. title,
+		Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		BackgroundTransparency = 1,
+		LayoutOrder = nextOrder(parent),
+		Parent = parent,
+	}, {
+		create("UIListLayout", {
+			Padding = UDim.new(0, 8),
+			SortOrder = Enum.SortOrder.LayoutOrder,
+		}),
+	})
+
+	local header = create("TextButton", {
+		Name = "Header",
+		Size = UDim2.new(1, 0, 0, 40),
+		BackgroundColor3 = THEME.TabIdle,
+		AutoButtonColor = false,
+		Text = "",
+		LayoutOrder = 0,
+		Parent = holder,
+	}, { corner(10), border(THEME.PanelBorder, 3) })
+
+	local arrow = newLabel({
+		Name = "Arrow",
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.new(0, 22, 0.5, 0),
+		Size = UDim2.fromOffset(24, 24),
+		Text = ">",
+		TextSize = 24,
+		Rotation = open and 90 or 0,
+		Parent = header,
+	}, 2)
+
+	newLabel({
+		Name = "Title",
+		Text = title,
+		TextSize = 22,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+		Position = UDim2.fromOffset(42, 0),
+		Size = UDim2.new(1, -52, 1, 0),
+		Parent = header,
+	}, 2)
+
+	local body = create("Frame", {
+		Name = "Body",
+		Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		BackgroundTransparency = 1,
+		Visible = open,
+		LayoutOrder = 1,
+		Parent = holder,
+	}, {
+		create("UIListLayout", {
+			Padding = UDim.new(0, 8),
+			SortOrder = Enum.SortOrder.LayoutOrder,
+		}),
+		create("UIPadding", { PaddingLeft = UDim.new(0, 12) }),
+	})
+
+	local group = { Holder = holder, Body = body, Header = header }
+
+	function group.Set(newOpen)
+		open = newOpen == true
+		groupOpenState[key] = open
+		body.Visible = open
+		TweenService:Create(arrow, TWEEN_FAST, { Rotation = open and 90 or 0 }):Play()
+	end
+
+	function group.IsOpen()
+		return open
+	end
+
+	function group.Destroy()
+		local list = pageGroups[parent]
+		local index = list and table.find(list, group)
+		if index then
+			table.remove(list, index)
+		end
+		holder:Destroy()
+	end
+
+	header.Activated:Connect(function()
+		group.Set(not open)
+	end)
+
+	pageGroups[parent] = pageGroups[parent] or {}
+	table.insert(pageGroups[parent], group)
+
+	return group
+end
+
+local function setAllGroups(parent, open)
+	for _, group in ipairs(pageGroups[parent] or {}) do
+		group.Set(open)
+		setAllGroups(group.Body, open) -- subgrupos
+	end
+end
+
+-- linha com os botoes "Expandir tudo" / "Recolher tudo" para as abas com muitos grupos
+local function addExpandControls(page)
+	local row = create("Frame", {
+		Name = "ExpandControls",
+		Size = UDim2.new(1, 0, 0, 38),
+		BackgroundTransparency = 1,
+		LayoutOrder = nextOrder(page),
+		Parent = page,
+	}, {
+		create("UIListLayout", {
+			FillDirection = Enum.FillDirection.Horizontal,
+			Padding = UDim.new(0, 8),
+			SortOrder = Enum.SortOrder.LayoutOrder,
+		}),
+	})
+
+	local function makeButton(text, order, open)
+		local button = create("TextButton", {
+			Name = "Expand_" .. order,
+			Size = UDim2.new(0.5, -4, 1, 0),
+			BackgroundColor3 = THEME.On,
+			Text = text,
+			Font = THEME.Font,
+			TextSize = 20,
+			TextColor3 = Color3.new(1, 1, 1),
+			LayoutOrder = order,
+			Parent = row,
+		}, { corner(8), border(THEME.OnBorder, 2), textStroke(2, THEME.OnBorder) })
+		button.Activated:Connect(function()
+			setAllGroups(page, open)
+		end)
+	end
+
+	makeButton("Expandir tudo", 1, true)
+	makeButton("Recolher tudo", 2, false)
+end
+
+local function addToggle(parent, name, desc, default, callback, key)
+	local row = baseRow(parent, name, desc, 90)
+	local state = default == true
+
+	local OFF_POS = UDim2.new(0, 3, 0.5, 0)
+	local ON_POS = UDim2.new(1, -29, 0.5, 0)
+
+	local trackStroke = border(state and THEME.OnBorder or THEME.KnobBorder, 2)
+	local track = create("TextButton", {
+		Name = "Track",
+		AnchorPoint = Vector2.new(1, 0.5),
+		Position = UDim2.new(1, -10, 0.5, 0),
+		Size = UDim2.fromOffset(64, 30),
+		BackgroundColor3 = state and THEME.On or THEME.Off,
+		AutoButtonColor = false,
+		Text = "",
+		Parent = row,
+	}, { pill(), trackStroke })
+
+	local knob = create("Frame", {
+		Name = "Knob",
+		AnchorPoint = Vector2.new(0, 0.5),
+		Position = state and ON_POS or OFF_POS,
+		Size = UDim2.fromOffset(26, 26),
+		BackgroundColor3 = Color3.new(1, 1, 1),
+		Parent = track,
+	}, { pill(), border(THEME.KnobBorder, 2) })
+
+	local function apply(newState, silent)
+		state = newState
+		TweenService:Create(track, TWEEN_FAST, {
+			BackgroundColor3 = state and THEME.On or THEME.Off,
+		}):Play()
+		TweenService:Create(knob, TWEEN_FAST, {
+			Position = state and ON_POS or OFF_POS,
+		}):Play()
+		trackStroke.Color = state and THEME.OnBorder or THEME.KnobBorder
+		if callback and not silent then
+			spawnTask(callback, state)
+		end
+	end
+
+	track.Activated:Connect(function()
+		apply(not state)
+	end)
+
+	local handle = {
+		Row = row,
+		Set = function(value, silent)
+			apply(value == true, silent)
+		end,
+		Get = function()
+			return state
+		end,
+		SetDesc = function(text)
+			setRowDesc(row, text)
+		end,
+	}
+	if key then
+		Settings.Controls[key] = { Kind = "toggle", Handle = handle }
+	end
+	return handle
+end
+
+-- o ScrollingFrame da aba (para travar o scroll enquanto arrasta um slider)
+local function scrollerOf(parent)
+	if parent:IsA("ScrollingFrame") then
+		return parent
+	end
+	return parent:FindFirstAncestorOfClass("ScrollingFrame")
+end
+
+-- um unico par de conexoes globais serve para todos os sliders
+local activeSlider -- { Update = fn, Parent = parent do slider }
+
+connect(UserInputService.InputChanged, function(input)
+	if activeSlider and isMotion(input) then
+		activeSlider.Update(input)
+	end
+end)
+
+connect(UserInputService.InputEnded, function(input)
+	if activeSlider and isPointer(input) then
+		local scroller = scrollerOf(activeSlider.Parent)
+		if scroller then
+			scroller.ScrollingEnabled = true
+		end
+		activeSlider = nil
+	end
+end)
+
+local function addSlider(parent, name, desc, min, max, default, callback, step, key)
+	step = step or 1
+	local row = baseRow(parent, name, desc, 270)
+	local value -- nil ate o primeiro setValue (garante que a UI seja desenhada)
+
+	local track = create("Frame", {
+		Name = "Track",
+		AnchorPoint = Vector2.new(1, 0.5),
+		Position = UDim2.new(1, -24, 0.5, 0),
+		Size = UDim2.fromOffset(170, 16),
+		BackgroundColor3 = THEME.Track,
+		Parent = row,
+	}, { pill(), border(THEME.KnobBorder, 2) })
+
+	local fill = create("Frame", {
+		Name = "Fill",
+		Size = UDim2.fromScale(0, 1),
+		BackgroundColor3 = THEME.On,
+		Parent = track,
+	}, { pill() })
+
+	local knob = create("Frame", {
+		Name = "Knob",
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromScale(0, 0.5),
+		Size = UDim2.fromOffset(30, 30),
+		BackgroundColor3 = Color3.new(1, 1, 1),
+		ZIndex = 2,
+		Parent = track,
+	}, { pill(), border(THEME.KnobBorder, 2) })
+
+	local valueLabel = newLabel({
+		Name = "Value",
+		AnchorPoint = Vector2.new(1, 0.5),
+		Position = UDim2.new(1, -214, 0.5, 0),
+		Size = UDim2.fromOffset(44, 24),
+		TextSize = 18,
+		TextXAlignment = Enum.TextXAlignment.Right,
+		Text = "",
+		Parent = row,
+	}, 1.5)
+
+	local function setValue(v, silent)
+		v = math.clamp(min + math.round((v - min) / step) * step, min, max)
+		v = tonumber(string.format("%.4f", v)) -- remove o ruido de ponto flutuante (0.15000000000000002)
+		if v == value then
+			return -- sem mudanca: nao redesenha nem dispara o callback
+		end
+		value = v
+
+		local alpha = max > min and (v - min) / (max - min) or 0
+		fill.Size = UDim2.fromScale(alpha, 1)
+		knob.Position = UDim2.new(alpha, 0, 0.5, 0)
+		valueLabel.Text = tostring(v)
+
+		if callback and not silent then
+			spawnTask(callback, v)
+		end
+	end
+
+	local function updateFromInput(input)
+		local alpha = math.clamp((input.Position.X - track.AbsolutePosition.X) / track.AbsoluteSize.X, 0, 1)
+		setValue(min + alpha * (max - min))
+	end
+
+	local hit = create("TextButton", {
+		Name = "Hit",
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromScale(0.5, 0.5),
+		Size = UDim2.new(1, 30, 0, 36),
+		BackgroundTransparency = 1,
+		Text = "",
+		ZIndex = 3,
+		Parent = track,
+	})
+
+	hit.InputBegan:Connect(function(input)
+		if isPointer(input) then
+			activeSlider = { Update = updateFromInput, Parent = parent }
+			-- trava o scroll da aba enquanto arrasta o slider
+			local scroller = scrollerOf(parent)
+			if scroller then
+				scroller.ScrollingEnabled = false
+			end
+			updateFromInput(input)
+		end
+	end)
+
+	setValue(default, true)
+
+	local handle = {
+		Row = row,
+		Set = function(v, silent)
+			setValue(v, silent)
+		end,
+		Get = function()
+			return value
+		end,
+		SetDesc = function(text)
+			setRowDesc(row, text)
+		end,
+	}
+	if key then
+		Settings.Controls[key] = { Kind = "slider", Handle = handle }
+	end
+	return handle
+end
+
+local function addButton(parent, name, desc, buttonText, callback)
+	local row = baseRow(parent, name, desc, 130)
+
+	local frameStroke = border(THEME.OnBorder, 2)
+	local textOutline = textStroke(2, THEME.OnBorder)
+	local button = create("TextButton", {
+		Name = "Action",
+		AnchorPoint = Vector2.new(1, 0.5),
+		Position = UDim2.new(1, -10, 0.5, 0),
+		Size = UDim2.fromOffset(96, 34),
+		BackgroundColor3 = THEME.On,
+		Text = buttonText,
+		Font = THEME.Font,
+		TextSize = 20,
+		TextColor3 = Color3.new(1, 1, 1),
+		Parent = row,
+	}, { corner(8), frameStroke, textOutline })
+
+	button.Activated:Connect(function()
+		if callback then
+			spawnTask(callback)
+		end
+	end)
+
+	return {
+		Row = row,
+		Button = button,
+		SetText = function(text)
+			button.Text = text
+		end,
+		SetDesc = function(text)
+			setRowDesc(row, text)
+		end,
+		-- cor do fundo e da borda/contorno do botao
+		SetStyle = function(fillColor, strokeColor)
+			button.BackgroundColor3 = fillColor
+			frameStroke.Color = strokeColor
+			textOutline.Color = strokeColor
+		end,
+	}
+end
+
+---------------------------------------------------------------------
+-- LOGICA: personagem
+---------------------------------------------------------------------
+local saved = {} -- valores escolhidos pelo jogador (reaplicados ao respawnar)
+
+local function getHumanoid()
+	local char = player.Character
+	return char and char:FindFirstChildOfClass("Humanoid")
+end
+
+local function getRoot()
+	local char = player.Character
+	return char and char:FindFirstChild("HumanoidRootPart")
+end
+
+-- espera o personagem existir; retorna false se nao apareceu em ~5s
+local function waitForRoot()
+	for _ = 1, 50 do
+		if getRoot() then
+			return true
+		end
+		task.wait(0.1)
+	end
+	return false
+end
+
+local function teleportTo(position)
+	local root = getRoot()
+	if not root then
+		return false
+	end
+	root.AssemblyLinearVelocity = Vector3.zero -- nao herda a velocidade de queda
+	root.AssemblyAngularVelocity = Vector3.zero
+	root.CFrame = CFrame.new(position)
+	return true
+end
+
+local function teleportCFrame(cf)
+	local root = getRoot()
+	if not root or not cf then
+		return false
+	end
+	root.AssemblyLinearVelocity = Vector3.zero
+	root.AssemblyAngularVelocity = Vector3.zero
+	root.CFrame = cf
+	return true
+end
+
+-- espera o personagem e teleporta; sem personagem, aborta a rotina (quem chama roda dentro de pcall)
+local function goTo(position)
+	if not waitForRoot() then
+		error("sem personagem", 0)
+	end
+	teleportTo(position)
+end
+
+local function applyCharacterSettings(char)
+	local hum = char:WaitForChild("Humanoid", 5)
+	if not hum then
+		return
+	end
+	if saved.WalkSpeed then
+		hum.WalkSpeed = saved.WalkSpeed
+	end
+	if saved.JumpPower then
+		hum.UseJumpPower = true
+		hum.JumpPower = saved.JumpPower
+	end
+end
+
+connect(player.CharacterAdded, applyCharacterSettings)
+
+---------------------------------------------------------------------
+-- LOGICA: loops automaticos e rede
+---------------------------------------------------------------------
+local debugEnabled = false -- ligado pelo toggle "Debug" da aba Cliente
+
+-- Cria um loop que so roda enquanto estiver ligado (e some no Kill Code)
+local function makeLoop(step, getDelay)
+	local thread
+	local loop = {}
+
+	function loop.Set(on)
+		if on and not thread then
+			thread = spawnTask(function()
+				while alive do
+					local ok, err = pcall(step)
+					if not ok then
+						warn("[SettingsGui] erro no loop:", err)
+					end
+					task.wait(getDelay())
+				end
+			end)
+		elseif not on and thread then
+			pcall(task.cancel, thread)
+			thread = nil
+		end
+	end
+
+	return loop
+end
+
+local Net = { Remote = nil, Warned = false }
+
+function Net.getRemote()
+	if Net.Remote and Net.Remote.Parent then
+		return Net.Remote
+	end
+	Net.Remote = ReplicatedStorage:FindFirstChild("NetworkRemoteEvent")
+		or ReplicatedStorage:FindFirstChild("NetworkRemoteEvent", true)
+	return Net.Remote
+end
+
+-- NetworkRemoteEvent:FireServer(...) com protecao; retorna ok, erro
+function Net.fire(...)
+	local remote = Net.getRemote()
+	if not remote then
+		if not Net.Warned then
+			Net.Warned = true
+			warn("[SettingsGui] NetworkRemoteEvent nao encontrado em ReplicatedStorage")
+		end
+		return false, "NetworkRemoteEvent nao encontrado"
+	end
+	Net.Warned = false
+	return pcall(remote.FireServer, remote, ...)
+end
+
+---------------------------------------------------------------------
+-- LOGICA: equipes por mundo
+---------------------------------------------------------------------
+local Teams = { LastSlot = nil }
+
+function Teams.slotForWorld(worldName)
+	if worldName == "Lobby" then
+		return Cfg.LobbyTeam
+	elseif worldName == "Céu" then
+		return Cfg.SkyWorldTeam
+	end
+	return Cfg.DefaultWorldTeam
+end
+
+function Teams.equipSlot(slot)
+	if not Cfg.AutoEquipTeams or type(slot) ~= "number" then
+		return
+	end
+	if Teams.LastSlot == slot then
+		return
+	end
+	local ok, err = Net.fire("EquipTeam", slot)
+	if ok then
+		Teams.LastSlot = slot
+		if debugEnabled then
+			print(("[SettingsGui] EquipTeam %d"):format(slot))
+		end
+		if Cfg.EquipTeamDelay > 0 then
+			task.wait(Cfg.EquipTeamDelay)
+		end
+	elseif debugEnabled then
+		warn(("[SettingsGui] Falha EquipTeam %d: %s"):format(slot, tostring(err)))
+	end
+end
+
+function Teams.equipForWorld(worldName)
+	Teams.equipSlot(Teams.slotForWorld(worldName))
+end
+
+---------------------------------------------------------------------
+-- LOGICA: mundos (portais e retorno ao Lobby)
+---------------------------------------------------------------------
+-- O teleporte do Portal/Retorno e feito pelo servidor e leva um tempo. Aqui o script so continua depois
+-- de CONFERIR que o personagem chegou (posicao no Lobby ou no mundo certo), em vez de esperar um tempo fixo.
+local Worlds = {}
+
+-- mundo em que o personagem esta agora, ou nil se nao ha personagem
+function Worlds.current()
+	local root = getRoot()
+	return root and worldAt(root.Position) or nil
+end
+
+-- espera o personagem estar no mundo "title"
+function Worlds.waitFor(title, timeout)
+	local deadline = os.clock() + timeout
+	repeat
+		if Worlds.current() == title then
+			return true
+		end
+		task.wait(0.2)
+	until os.clock() >= deadline
+	return false
+end
+
+-- Teleporta para um portal/retorno e so retorna true quando o personagem realmente chegou em "title".
+-- Se nao chegou, teleporta de novo (Cfg.PortalAttempts); no fim espera fallbackDelay e confere uma ultima vez.
+function Worlds.travel(spot, title, setStatus, text, fallbackDelay)
+	for attempt = 1, Cfg.PortalAttempts do
+		if attempt > 1 then
+			setStatus(("%s - retry %d/%d"):format(text, attempt, Cfg.PortalAttempts))
+		end
+		goTo(spot.Pos)
+		if Worlds.waitFor(title, Cfg.PortalArriveTimeout) then
+			if debugEnabled then
+				print(("[SettingsGui] %s: chegou em %s (tentativa %d)"):format(text, title, attempt))
+			end
+			task.wait(Cfg.WorldSettleDelay)
+			return true
+		end
+	end
+
+	setStatus(("%s - waiting %ds"):format(text, fallbackDelay))
+	task.wait(fallbackDelay)
+	local arrived = Worlds.current() == title
+	if debugEnabled then
+		print(("[SettingsGui] %s: sem confirmacao apos as tentativas; depois do delay %s em %s"):format(
+			text, arrived and "chegou" or "NAO chegou", title
+		))
+	end
+	return arrived
+end
+
+-- Garante que o personagem esta no Lobby: se estiver dentro de um mundo, usa o Retorno dele.
+function Worlds.ensureLobby(setStatus)
+	if not waitForRoot() then
+		error("sem personagem", 0)
+	end
+	local world = Worlds.current()
+	if world == "Lobby" then
+		return true
+	end
+	local back = spotOf(world, "return")
+	if not back then
+		return false
+	end
+	setStatus("Returning to Lobby")
+	return Worlds.travel(back, "Lobby", setStatus, "Retorno Lobby", Cfg.ReturnDelay)
+end
+
+-- Leva o personagem ao mundo "title": primeiro o Lobby, depois o Portal do mundo. true se chegou.
+function Worlds.enter(title, setStatus)
+	setStatus = setStatus or noop
+	if not title then
+		return false
+	end
+	if Worlds.current() == title then
+		return true
+	end
+	if not Worlds.ensureLobby(setStatus) then
+		return false
+	end
+	if title == "Lobby" then
+		return true
+	end
+	local portal = spotOf(title, "portal")
+	if not portal then
+		return false
+	end
+	return Worlds.travel(portal, title, setStatus, "Portal " .. title, Cfg.PortalDelay)
+end
+
+---------------------------------------------------------------------
+-- LOGICA: Collect all chests
+---------------------------------------------------------------------
+-- Rota: Lobby (so baus) e depois cada mundo: Portal -> espera -> baus -> Retorno Lobby.
+-- Ao iniciar, grava a posicao atual e, ao encerrar, volta para ela.
+-- Baus em cooldown sao pulados, e mundos inteiros em cooldown nem sao visitados.
+-- Chests.Thread = a thread da coleta enquanto ela roda (os outros loops se pausam)
+local Chests = { Thread = nil, StartCFrame = nil }
+
+do
+	local function buildRoutes()
+		local routes = {}
+		for _, group in ipairs(TELEPORT_GROUPS) do
+			local route = { World = group.Title, Chests = {} }
+			for _, loc in ipairs(group.Locations) do
+				if loc.Kind == "portal" then
+					route.Portal = loc
+				elseif loc.Kind == "return" then
+					route.Return = loc
+				elseif loc.Kind == "chest" then
+					table.insert(route.Chests, loc)
+				end
+			end
+			local isWorld = route.Portal ~= nil and route.Return ~= nil
+			local isLobby = route.Portal == nil and route.Return == nil
+			if (isWorld or isLobby) and #route.Chests > 0 then
+				table.insert(routes, route)
+			end
+		end
+		return routes
+	end
+
+	-- Vigia de recompensa -------------------------------------------
+	local function isWatched(name)
+		if #Cfg.WatchNames == 0 then
+			return true
+		end
+		for _, wanted in ipairs(Cfg.WatchNames) do
+			if wanted:lower() == name:lower() then
+				return true
+			end
+		end
+		return false
+	end
+
+	-- lista os valores numericos que valem a pena vigiar (e guarda o valor atual de cada um)
+	local function listWatchers()
+		local watchers = {}
+		eachNumericValue(function(name, _, read)
+			local value = read()
+			if type(value) == "number" and isWatched(name) then
+				table.insert(watchers, { Name = name, Read = read, Start = value })
+			end
+		end)
+		return watchers
+	end
+
+	-- Descarta valores que mudam sozinhos (timers, renda passiva) para nao dar falso positivo.
+	-- Se voce definiu WatchNames, confia nos nomes que escolheu e nao descarta nada.
+	local function buildWatchers()
+		local watchers = listWatchers()
+		if #Cfg.WatchNames == 0 and #watchers > 0 then
+			task.wait(Cfg.CalibrateTime)
+			local stable = {}
+			for _, watcher in ipairs(watchers) do
+				if watcher.Read() == watcher.Start then
+					table.insert(stable, watcher)
+				end
+			end
+			watchers = stable
+		end
+		return watchers
+	end
+
+	local function rebase(watchers)
+		for _, watcher in ipairs(watchers) do
+			local now = watcher.Read()
+			if type(now) == "number" then
+				watcher.Start = now
+			end
+		end
+	end
+
+	-- retorna o nome e o quanto subiu, se algum valor vigiado aumentou
+	local function findIncrease(watchers)
+		for _, watcher in ipairs(watchers) do
+			local now = watcher.Read()
+			if type(now) == "number" and now > watcher.Start then
+				return watcher.Name, now - watcher.Start
+			end
+		end
+		return nil
+	end
+
+	-- Timers dos baus -----------------------------------------------
+	-- O jogo mostra "Next Chest in:\nHH:MM:SS" em Workspace...Chest.Regen.Info.
+	-- Usamos isso para (1) pular baus em cooldown, (2) confirmar a coleta (o timer aparece)
+	-- e (3) saber quando o proximo bau fica pronto.
+	local function fmtTime(seconds)
+		seconds = math.max(0, math.floor(seconds))
+		local h = seconds // 3600
+		local m = (seconds % 3600) // 60
+		local s = seconds % 60
+		if h > 0 then
+			return ("%d:%02d:%02d"):format(h, m, s)
+		end
+		return ("%02d:%02d"):format(m, s)
+	end
+
+	local function parseCountdown(text)
+		local h, m, s = text:match("(%d+):(%d+):(%d+)")
+		if h then
+			return tonumber(h) * 3600 + tonumber(m) * 60 + tonumber(s)
+		end
+		local m2, s2 = text:match("(%d+):(%d+)")
+		if m2 then
+			return tonumber(m2) * 60 + tonumber(s2)
+		end
+		return nil
+	end
+
+	-- quando cada bau fica pronto (os.time). Fica em _G para sobreviver a re-execucao.
+	local readyAt = _G.SettingsGuiChestTimers or {}
+	_G.SettingsGuiChestTimers = readyAt
+	do
+		local now = os.time()
+		for key, at in pairs(readyAt) do
+			if at <= now then
+				readyAt[key] = nil -- poda timers vencidos
+			end
+		end
+	end
+
+	local function chestKey(chest)
+		return game.JobId .. "|" .. chest.Name
+	end
+
+	-- Registro dos timers carregados no mapa agora (o jogo so carrega o que esta perto).
+	-- Tabela fraca: timers destruidos pelo streaming saem sozinhos.
+	local timerLabels = setmetatable({}, { __mode = "k" })
+
+	local function isTimerLabel(inst)
+		if not inst:IsA("TextLabel") then
+			return false
+		end
+		if inst.Name == "Info" and inst.Parent and inst.Parent.Name == "Regen" then
+			return true
+		end
+		return inst.Text:find("Next Chest", 1, true) ~= nil
+	end
+
+	connect(workspace.DescendantAdded, function(inst)
+		if isTimerLabel(inst) then
+			timerLabels[inst] = true
+		end
+	end)
+
+	spawnTask(function()
+		local descendants = workspace:GetDescendants()
+		for i, inst in ipairs(descendants) do
+			if isTimerLabel(inst) then
+				timerLabels[inst] = true
+			end
+			if i % 4000 == 0 then
+				task.wait()
+			end
+		end
+	end)
+
+	local function labelPosition(timerLabel)
+		local part = timerLabel:FindFirstAncestorWhichIsA("BasePart")
+		if part then
+			return part.Position
+		end
+
+		local billboard = timerLabel:FindFirstAncestorWhichIsA("BillboardGui")
+		local adornee = billboard and billboard.Adornee
+		if adornee then
+			if adornee:IsA("BasePart") then
+				return adornee.Position
+			elseif adornee:IsA("Attachment") then
+				return adornee.WorldPosition
+			elseif adornee:IsA("Model") then
+				return adornee:GetPivot().Position
+			end
+		end
+
+		local model = timerLabel:FindFirstAncestorOfClass("Model")
+		if model then
+			return model:GetPivot().Position
+		end
+		return nil
+	end
+
+	-- o texto so conta se o timer esta realmente visivel (nenhum ancestral escondido/desligado)
+	local function isShown(timerLabel)
+		local node = timerLabel
+		while node and node ~= workspace do
+			if node:IsA("GuiObject") and not node.Visible then
+				return false
+			end
+			if node:IsA("LayerCollector") and not node.Enabled then
+				return false
+			end
+			node = node.Parent
+		end
+		return true
+	end
+
+	-- "cooldown", segundos  |  "ready" (timer carregado, sem contagem)  |  nil (timer sumiu do mapa)
+	local function readLabel(timerLabel)
+		if not timerLabel:IsDescendantOf(workspace) then
+			return nil
+		end
+		local secs = parseCountdown(timerLabel.Text)
+		if secs and secs > 0 and isShown(timerLabel) then
+			return "cooldown", secs
+		end
+		return "ready"
+	end
+
+	-- acha o timer carregado que fica em cima do bau da lista (compara posicao)
+	local function findLabelFor(chest)
+		for timerLabel in pairs(timerLabels) do
+			if timerLabel:IsDescendantOf(workspace) then
+				local pos = labelPosition(timerLabel)
+				if pos then
+					local d = pos - chest.Pos
+					if math.abs(d.Y) <= Cfg.TimerMatchY and Vector3.new(d.X, 0, d.Z).Magnitude <= Cfg.TimerMatchXZ then
+						return timerLabel
+					end
+				end
+			else
+				timerLabels[timerLabel] = nil
+			end
+		end
+		return nil
+	end
+
+	local function waitForLabel(chest, timeout)
+		local deadline = os.clock() + timeout
+		repeat
+			local timerLabel = findLabelFor(chest)
+			if timerLabel then
+				return timerLabel
+			end
+			task.wait(Cfg.ChestPoll)
+		until os.clock() >= deadline
+		return nil
+	end
+
+	-- Situacao do bau: "cooldown", segundos | "ready" | "unknown"  (+ o timer, se estiver carregado)
+	-- So "cooldown" faz o script pular o bau; "ready" e "unknown" sempre tentam coletar.
+	local function chestStatus(chest)
+		local timerLabel = findLabelFor(chest)
+		if timerLabel then
+			local state, secs = readLabel(timerLabel)
+			if state == "cooldown" then
+				readyAt[chestKey(chest)] = os.time() + secs
+				return "cooldown", secs, timerLabel
+			elseif state == "ready" then
+				readyAt[chestKey(chest)] = nil
+				return "ready", nil, timerLabel
+			end
+		end
+
+		local at = readyAt[chestKey(chest)]
+		if at then
+			local left = at - os.time()
+			if left > 0 then
+				return "cooldown", left
+			end
+			readyAt[chestKey(chest)] = nil
+		end
+		return "unknown"
+	end
+
+	-- menor tempo restante entre os baus conhecidos (neste servidor)
+	local function nextChestReady()
+		local now = os.time()
+		local prefix = game.JobId .. "|"
+		local bestSecs, bestName
+		for key, at in pairs(readyAt) do
+			local left = at - now
+			if left > 0 and key:sub(1, #prefix) == prefix and (not bestSecs or left < bestSecs) then
+				bestSecs, bestName = left, key:sub(#prefix + 1)
+			end
+		end
+		return bestSecs, bestName
+	end
+
+	-- Espera a confirmacao da coleta. Retorna "ok"/"cooldown" e uma nota, ou nil se nada aconteceu.
+	local function waitForCollected(chest, timerLabel, watchers, timeout)
+		local deadline = os.clock() + timeout
+		repeat
+			local current = timerLabel or findLabelFor(chest)
+			if current then
+				local state, secs = readLabel(current)
+				if state == "cooldown" then
+					readyAt[chestKey(chest)] = os.time() + secs
+					if timerLabel then
+						-- antes estava pronto e agora tem timer: coletou
+						return "ok", "timer " .. fmtTime(secs)
+					end
+					-- o timer so carregou agora: nao da pra saber se coletamos ou se ja estava em cooldown
+					local name, delta = findIncrease(watchers)
+					if name then
+						return "ok", ("+%.0f %s"):format(delta, name)
+					end
+					return "cooldown", fmtTime(secs)
+				end
+			end
+
+			-- sem timer confiavel: confirma por Coins/Gems
+			if not timerLabel then
+				local name, delta = findIncrease(watchers)
+				if name then
+					return "ok", ("+%.0f %s"):format(delta, name)
+				end
+			end
+
+			task.wait(Cfg.ChestPoll)
+		until os.clock() >= deadline
+		return nil
+	end
+
+	-- Verifica o timer, coleta e confirma.
+	-- Retorna "ok", "cooldown" (pulado), "fail" ou "unverified" e uma nota.
+	local function collectChest(chest, watchers, setStatus, text, worldTitle)
+		-- se o personagem saiu do mundo do bau (ex.: morreu e renasceu no Lobby), nao teleporta para as
+		-- coordenadas do bau: devolve "left" e quem chamou volta a entrar no mundo antes de tentar de novo
+		local function leftWorld()
+			return worldTitle ~= nil and Worlds.current() ~= worldTitle
+		end
+
+		-- 1) timer ja conhecido (carregado agora ou lido antes): pula se ainda esta em cooldown
+		local status, secs, timerLabel = chestStatus(chest)
+		if status == "cooldown" then
+			return "cooldown", fmtTime(secs)
+		end
+
+		-- 2) timer ainda nao carregou: chega perto (sem encostar) so para carregar a area e ler o timer
+		if not timerLabel then
+			if leftWorld() then
+				return "left", "saiu do mundo"
+			end
+			setStatus(text .. " - checking timer")
+			goTo(chest.Pos + Vector3.new(0, Cfg.PreHover, 0))
+			if waitForLabel(chest, Cfg.StreamWait) then
+				task.wait(Cfg.LabelSettle)
+				status, secs, timerLabel = chestStatus(chest)
+				if status == "cooldown" then
+					return "cooldown", fmtTime(secs)
+				end
+			end
+		end
+
+		-- 3) sem timer e sem valores para vigiar: so visita
+		if not timerLabel and #watchers == 0 then
+			if leftWorld() then
+				return "left", "saiu do mundo"
+			end
+			goTo(chest.Pos)
+			task.wait(Cfg.UnverifiedDelay)
+			return "unverified", "sem timer e sem valores para vigiar"
+		end
+
+		-- 4) coleta e confirma
+		for attempt = 1, Cfg.ChestAttempts do
+			if attempt > 1 then
+				setStatus(("%s - try %d/%d"):format(text, attempt, Cfg.ChestAttempts))
+			end
+
+			if leftWorld() then
+				return "left", "saiu do mundo"
+			end
+			rebase(watchers)
+			goTo(chest.Pos)
+
+			local outcome, note = waitForCollected(chest, timerLabel, watchers, Cfg.ChestTimeout)
+			if outcome then
+				task.wait(Cfg.ChestAfterDelay)
+				return outcome, note
+			end
+
+			-- sem confirmacao: sobe um pouco e cai de volta no bau (re-dispara o toque) na proxima tentativa
+			if attempt < Cfg.ChestAttempts then
+				if leftWorld() then
+					return "left", "saiu do mundo"
+				end
+				teleportTo(chest.Pos + Vector3.new(0, 10, 0))
+				task.wait(Cfg.ChestRetryBounce)
+			end
+		end
+
+		return "fail", "sem confirmacao (timer/recompensa)"
+	end
+
+	local function returnToStart(setStatus)
+		if not (Cfg.ReturnToStartOnFinish and Chests.StartCFrame) then
+			return
+		end
+		setStatus = setStatus or noop
+		if Cfg.ReturnStartDelay > 0 then
+			task.wait(Cfg.ReturnStartDelay)
+		end
+		if not waitForRoot() then
+			return
+		end
+
+		local startCFrame = Chests.StartCFrame
+		local startWorld = worldAt(startCFrame.Position)
+
+		-- volta ao mundo de origem pelo caminho certo (Lobby -> Portal), nao direto
+		if Cfg.ReturnToStartViaPortal and Worlds.current() ~= startWorld then
+			if not Worlds.enter(startWorld, setStatus) then
+				warn("[SettingsGui] nao confirmou a volta para " .. tostring(startWorld) .. "; teleportando direto")
+			end
+		end
+
+		teleportCFrame(startCFrame)
+
+		-- a ultima equipe equipada foi a do ultimo mundo visitado: volta para a do mundo onde voce estava
+		if Cfg.EquipStartTeamOnFinish and startWorld then
+			Teams.equipForWorld(startWorld)
+		end
+		Chests.StartCFrame = nil -- nao reaproveita uma posicao antiga numa proxima parada
+	end
+
+	local function collectAll(setStatus)
+		local root = getRoot()
+		Chests.StartCFrame = root and root.CFrame or nil
+		Teams.LastSlot = nil
+
+		local routes = buildRoutes()
+
+		setStatus("Reading values...")
+		local watchers = buildWatchers()
+
+		local names = {}
+		for _, watcher in ipairs(watchers) do
+			table.insert(names, watcher.Name)
+		end
+		if #watchers > 0 then
+			print(("[SettingsGui] Vigiando %d valor(es): %s"):format(#watchers, table.concat(names, ", ")))
+		end
+
+		local collected, onCooldown, unverified = 0, 0, 0
+		local failed = {}
+
+		for index, route in ipairs(routes) do
+			local prefix = ("%s (%d/%d)"):format(route.World, index, #routes)
+
+			-- mundo inteiro em cooldown (timers ja conhecidos): nem entra
+			local allCooling = true
+			for _, chest in ipairs(route.Chests) do
+				if chestStatus(chest) ~= "cooldown" then
+					allCooling = false
+					break
+				end
+			end
+			if allCooling then
+				onCooldown += #route.Chests
+				print(("[SettingsGui] %s: todos os baus em cooldown, mundo pulado"):format(route.World))
+				continue
+			end
+
+			-- sempre comeca no Lobby (se a coleta comecou dentro de um mundo, ou um retorno falhou, volta antes)
+			if not Worlds.ensureLobby(setStatus) then
+				error("nao foi possivel voltar ao Lobby", 0)
+			end
+
+			-- entra no mundo e SO continua depois de confirmar que chegou la
+			if route.Portal then
+				setStatus(prefix .. ": Portal")
+				if not Worlds.travel(route.Portal, route.World, setStatus, prefix .. ": Portal", Cfg.PortalDelay) then
+					table.insert(failed, route.World .. " (portal)")
+					warn("[SettingsGui] nao confirmou a entrada em " .. route.World .. "; mundo pulado")
+					continue
+				end
+			end
+
+			if Cfg.AutoEquipTeams then
+				setStatus(prefix .. ": Team " .. tostring(Teams.slotForWorld(route.World)))
+				Teams.equipForWorld(route.World)
+			end
+
+			local worldLost = false
+			for _, chest in ipairs(route.Chests) do
+				local text = prefix .. ": " .. chest.Name
+				local result, note
+
+				for _ = 1, 3 do
+					-- se algo te tirou do mundo (ex.: morreu e renasceu no Lobby), volta a entrar ANTES de (re)tentar o bau
+					if Worlds.current() ~= route.World then
+						setStatus(text .. " - re-entering")
+						if not Worlds.enter(route.World, setStatus) then
+							worldLost = true
+							break
+						end
+						if Cfg.AutoEquipTeams then
+							Teams.LastSlot = nil
+							Teams.equipForWorld(route.World)
+						end
+					end
+
+					setStatus(text)
+					result, note = collectChest(chest, watchers, setStatus, text, route.World)
+					if result ~= "left" then
+						break
+					end
+				end
+
+				if worldLost then
+					table.insert(failed, chest.Name)
+					warn("[SettingsGui] saiu de " .. route.World .. " e nao conseguiu voltar; resto do mundo pulado")
+					break
+				end
+
+				if result == "ok" then
+					collected += 1
+					print(("[SettingsGui] OK       %s (%s)"):format(chest.Name, note))
+				elseif result == "cooldown" then
+					onCooldown += 1
+					print(("[SettingsGui] COOLDOWN %s (%s)"):format(chest.Name, note))
+				elseif result == "unverified" then
+					unverified += 1
+					print(("[SettingsGui] ?        %s (%s)"):format(chest.Name, note))
+				else
+					table.insert(failed, chest.Name)
+					warn(("[SettingsGui] FALHOU   %s (%s)"):format(chest.Name, note))
+				end
+			end
+
+			-- volta ao Lobby e confere a chegada; se falhar, o inicio da proxima rota tenta de novo antes de qualquer bau
+			if route.Return then
+				setStatus(prefix .. ": Retorno Lobby")
+				if not Worlds.travel(route.Return, "Lobby", setStatus, prefix .. ": Retorno Lobby", Cfg.ReturnDelay) then
+					warn("[SettingsGui] nao confirmou o retorno ao Lobby de " .. route.World)
+				end
+			end
+		end
+
+		setStatus("Returning to start...")
+		returnToStart(setStatus)
+
+		local parts = { ("%d ok"):format(collected) }
+		if onCooldown > 0 then
+			table.insert(parts, onCooldown .. " cooldown")
+		end
+		if unverified > 0 then
+			table.insert(parts, unverified .. " unverified")
+		end
+		if #failed > 0 then
+			table.insert(parts, #failed .. " failed")
+			warn("[SettingsGui] Baus sem confirmacao: " .. table.concat(failed, ", "))
+		end
+		local nextSecs = nextChestReady()
+		if nextSecs then
+			table.insert(parts, "next " .. fmtTime(nextSecs))
+		end
+		return table.concat(parts, " | ")
+	end
+
+	-- Inicia a coleta numa thread; onDone(resumo) quando termina (ou com o erro, se falhar)
+	function Chests.start(setStatus, onDone)
+		if Chests.Thread then
+			return
+		end
+		Chests.Thread = spawnTask(function()
+			local ok, result = pcall(collectAll, setStatus)
+			Chests.Thread = nil
+			onDone(ok and result or ("Erro: " .. tostring(result)))
+		end)
+		if coroutine.status(Chests.Thread) == "dead" then
+			Chests.Thread = nil
+		end
+	end
+
+	function Chests.stop()
+		local wasRunning = Chests.Thread ~= nil
+		if Chests.Thread then
+			pcall(task.cancel, Chests.Thread)
+			Chests.Thread = nil
+		end
+		if wasRunning then
+			pcall(returnToStart) -- so volta se havia uma coleta em andamento
+		end
+	end
+
+	-- usados pelo AutoCollect Chest
+	Chests.nextReady = nextChestReady
+	Chests.fmtTime = fmtTime
+
+	-- Botao "Chest timers": mostra quando o proximo bau fica pronto e imprime os detalhes no F9
+	function Chests.checkTimers()
+		local counts = { cooldown = 0, ready = 0, unknown = 0 }
+		local nextSecs, nextName
+
+		for _, route in ipairs(buildRoutes()) do
+			for _, chest in ipairs(route.Chests) do
+				local status, secs = chestStatus(chest)
+				counts[status] += 1
+				if status == "cooldown" then
+					print(("[SettingsGui] %-28s cooldown %s"):format(chest.Name, fmtTime(secs)))
+					if not nextSecs or secs < nextSecs then
+						nextSecs, nextName = secs, chest.Name
+					end
+				else
+					print(("[SettingsGui] %-28s %s"):format(chest.Name, status))
+				end
+			end
+		end
+
+		-- diagnostico: texto cru dos timers carregados agora (bom para ver como fica um bau disponivel)
+		for timerLabel in pairs(timerLabels) do
+			if timerLabel:IsDescendantOf(workspace) then
+				print(("[SettingsGui] timer %s | text=%q | shown=%s"):format(
+					timerLabel:GetFullName(), timerLabel.Text, tostring(isShown(timerLabel))
+				))
+			end
+		end
+
+		local text
+		if nextSecs then
+			text = ("Next: %s in %s"):format(nextName, fmtTime(nextSecs))
+		elseif counts.ready > 0 then
+			text = ("%d chest(s) ready now"):format(counts.ready)
+		else
+			text = "No timers loaded yet"
+		end
+		if counts.unknown > 0 then
+			text = text .. (" | %d unknown"):format(counts.unknown)
+		end
+		return text
+	end
+end
+
+-- Blow Bubble: se a coleta de baus esta rodando, pausa (Coins/Gems subindo confundiria a verificacao)
+local blowBubble = { Delay = Cfg.BlowBubbleDelay }
+
+blowBubble.Loop = makeLoop(function()
+	if Cfg.PauseBlowBubbleWhileCollecting and Chests.Thread then
+		return
+	end
+	Net.fire("BlowBubble")
+end, function()
+	return blowBubble.Delay
+end)
+
+---------------------------------------------------------------------
+-- LOGICA: ovos / Auto Hatch
+---------------------------------------------------------------------
+-- Selected = ovo escolhido | Names = ovos conhecidos (ordenados) | Stands = onde ficar ao abrir
+-- World = mundo de cada ovo | Price = preco/moeda por unidade
+local Eggs = {
+	Selected = Cfg.DefaultEgg,
+	Delay = Cfg.HatchDelay,
+	Names = {},
+	Stands = {},
+	World = {},
+	Price = {},
+}
+
+function Eggs.add(name)
+	if table.find(Eggs.Names, name) then
+		return false
+	end
+	table.insert(Eggs.Names, name)
+	return true
+end
+
+function Eggs.isCrate(name)
+	return type(name) == "string" and name:find("%s[Cc][Rr][Aa][Tt][Ee]$") ~= nil
+end
+
+-- ovos (" Egg") e caixas (" Crate") usam o mesmo remote (PurchaseEgg), mas sao coisas diferentes
+function Eggs.isEgg(name)
+	return type(name) == "string" and #name <= 40
+		and (name:find("%s[Ee][Gg][Gg]$") ~= nil or Eggs.isCrate(name))
+end
+
+for _, world in ipairs(EGG_DATA) do
+	for _, row in ipairs(world.Eggs) do
+		Eggs.add(row[1])
+		Eggs.Stands[row[1]] = row[2]
+		Eggs.World[row[1]] = world.World
+		Eggs.Price[row[1]] = row[3]
+	end
+end
+
+-- ovos gravados pelo recorder (colados em EGG_SPOTS) sobrescrevem/complementam os de EGG_DATA
+for name, pos in pairs(EGG_SPOTS) do
+	if typeof(pos) == "Vector3" then
+		Eggs.add(name)
+		Eggs.Stands[name] = pos
+		if not Eggs.World[name] then
+			Eggs.World[name] = worldAt(pos)
+		end
+	end
+end
+
+Eggs.add(Cfg.DefaultEgg)
+
+-- Ordem por preco: Coins -> Gems -> moeda do mundo; dentro de cada moeda, do mais barato ao mais caro.
+-- Ovos sem preco conhecido (gravados pelo recorder) vao para o fim, em ordem alfabetica.
+local CURRENCY_RANK = { coins = 1, gems = 2 } -- qualquer outra moeda ("other currency") = 3
+
+function Eggs.priceKey(name)
+	local digits, currency = (Eggs.Price[name] or ""):match("^([%d,]+)%s*(%a*)")
+	local amount = digits and tonumber((digits:gsub(",", "")))
+	if not amount then
+		return 9, math.huge
+	end
+	return CURRENCY_RANK[currency:lower()] or 3, amount
+end
+
+function Eggs.sort()
+	table.sort(Eggs.Names, function(a, b)
+		local rankA, amountA = Eggs.priceKey(a)
+		local rankB, amountB = Eggs.priceKey(b)
+		if rankA ~= rankB then
+			return rankA < rankB
+		end
+		if amountA ~= amountB then
+			return amountA < amountB
+		end
+		return a < b
+	end)
+end
+
+Eggs.sort()
+
+do
+	-- Se o ovo e de outro mundo: volta ao Lobby e entra pelo Portal do mundo do ovo (conferindo a chegada)
+	local function enterWorldOf(egg)
+		local targetTitle = Eggs.World[egg]
+		if not (Cfg.HatchEnterWorld and targetTitle and getRoot()) then
+			return
+		end
+		Worlds.enter(targetTitle, noop)
+	end
+
+	-- Se o servidor checar distancia ate o ovo, chega perto antes de comprar
+	local function goToEgg(egg)
+		local pos = Eggs.Stands[egg]
+		local root = getRoot()
+		if pos and root and (root.Position - pos).Magnitude > Cfg.HatchGoDistance then
+			enterWorldOf(egg)
+			teleportTo(pos)
+			task.wait(0.5)
+		end
+	end
+
+	-- Botoes de "Ovos teleportes": vai ate o lugar do ovo (passando pelo Retorno/Portal se for de outro mundo)
+	function Eggs.goTo(egg)
+		local pos = Eggs.Stands[egg]
+		if not pos then
+			return false
+		end
+		if Cfg.EggTeleportViaPortal then
+			enterWorldOf(egg)
+		end
+		return teleportTo(pos)
+	end
+
+	Eggs.Loop = makeLoop(function()
+		-- nao compra enquanto o "Collect all chests" esta teleportando
+		if Chests.Thread then
+			return
+		end
+
+		local egg = Eggs.Selected
+		if Cfg.HatchGoToEgg then
+			goToEgg(egg)
+		end
+
+		local ok, err = Net.fire("PurchaseEgg", egg, Cfg.HatchFlag)
+		if debugEnabled then
+			print(("[SettingsGui] PurchaseEgg %q %s -> %s"):format(egg, tostring(Cfg.HatchFlag), ok and "enviado" or tostring(err)))
+		end
+	end, function()
+		return Eggs.Delay
+	end)
+end
+
+---------------------------------------------------------------------
+-- LOGICA: Egg recorder
+---------------------------------------------------------------------
+-- Quando voce abre um ovo, grava o nome, os argumentos, onde voce estava e tudo que achar do ovo,
+-- e copia para a area de transferencia (bloco EGG_SPOTS para colar na config).
+-- Deteccao: (1) hook no FireServer do NetworkRemoteEvent, se o executor tiver hookmetamethod;
+--           (2) ProximityPrompt do ovo; (3) botao "Mark egg here" (manual).
+-- Recorder.OnRecorded(nome) e Recorder.OnStatus(texto) sao preenchidos pela UI.
+local Recorder = {
+	Enabled = false,
+	Busy = false,
+	LastRemoteAt = 0,
+	Records = {}, -- nome -> { Name, Stand, Lines, Count }
+}
+
+do
+	-- o hook so e instalado uma vez por sessao (fica em _G para nao empilhar ao re-executar)
+	local hookState = _G.SettingsGuiHookState
+	if not hookState then
+		hookState = { Installed = false, Handler = nil }
+		_G.SettingsGuiHookState = hookState
+	end
+
+	local function setStatus(text)
+		if Recorder.OnStatus then
+			Recorder.OnStatus(text)
+		end
+	end
+
+	local function fmtVector(v)
+		return ("Vector3.new(%.4f, %.4f, %.4f)"):format(v.X, v.Y, v.Z)
+	end
+
+	local function fmtCFrame(cf)
+		local parts = {}
+		for _, n in ipairs({ cf:GetComponents() }) do
+			table.insert(parts, ("%.4f"):format(n))
+		end
+		return "CFrame.new(" .. table.concat(parts, ", ") .. ")"
+	end
+
+	local function oneLine(text, maxLen)
+		local s = tostring(text):gsub("%s+", " ")
+		if #s > maxLen then
+			s = s:sub(1, maxLen - 3) .. "..."
+		end
+		return s
+	end
+
+	local function fmtValue(v)
+		local t = typeof(v)
+		if t == "string" then
+			return ("%q"):format(v)
+		elseif t == "Instance" then
+			return "<" .. v:GetFullName() .. ">"
+		elseif t == "Vector3" then
+			return fmtVector(v)
+		elseif t == "table" then
+			return "{...}"
+		end
+		return tostring(v)
+	end
+
+	-- Foto de todos os numeros do jogador para ver o que mudou ao abrir o ovo
+	local function numericSnapshot()
+		local snap = {}
+		eachNumericValue(function(_, fullName, read)
+			snap[fullName] = read()
+		end)
+		return snap
+	end
+
+	local function describeChanges(before, after)
+		local changes = {}
+		for key, old in pairs(before) do
+			local new = after[key]
+			if type(old) == "number" and type(new) == "number" and new ~= old then
+				table.insert(changes, { Key = key, Old = old, New = new })
+			end
+		end
+		table.sort(changes, function(a, b)
+			return math.abs(a.New - a.Old) > math.abs(b.New - b.Old)
+		end)
+
+		local parts = {}
+		for i = 1, math.min(#changes, 6) do
+			local change = changes[i]
+			local shortKey = change.Key:match("[^%.]+$") or change.Key
+			local delta = change.New - change.Old
+			table.insert(parts, ("%s %s%.0f (%.0f -> %.0f)"):format(
+				shortKey, delta >= 0 and "+" or "", delta, change.Old, change.New
+			))
+		end
+		if #parts == 0 then
+			return "no numeric change detected"
+		end
+		return table.concat(parts, "; ")
+	end
+
+	local function eggObjectPosition(inst)
+		if inst:IsA("Model") then
+			return inst:GetPivot().Position
+		elseif inst:IsA("BasePart") then
+			return inst.Position
+		end
+		return nil
+	end
+
+	-- acha o objeto do ovo mais perto de voce (nome exato; se nao achar, qualquer " Egg"/" Crate")
+	local function findEggInstance(name, origin)
+		local exact, exactDist, any, anyDist
+
+		local function consider(inst)
+			if not (inst:IsA("Model") or inst:IsA("BasePart")) then
+				return
+			end
+			local isExact = name ~= nil and inst.Name == name
+			if not (isExact or Eggs.isEgg(inst.Name)) then
+				return
+			end
+			local pos = eggObjectPosition(inst)
+			if not pos then
+				return
+			end
+			local d = (pos - origin).Magnitude
+			if isExact then
+				if not exactDist or d < exactDist then
+					exact, exactDist = inst, d
+				end
+			elseif not anyDist or d < anyDist then
+				any, anyDist = inst, d
+			end
+		end
+
+		-- 1) busca barata: so o que esta perto de voce (sobe pela hierarquia de cada parte encontrada)
+		for _, part in ipairs(workspace:GetPartBoundsInRadius(origin, Cfg.EggSearchRadius)) do
+			local node = part
+			while node and node ~= workspace do
+				consider(node)
+				node = node.Parent
+			end
+		end
+
+		-- 2) nao achou: varre o Workspace inteiro (lento; cede a cada 4000 instancias)
+		if not (exact or any) then
+			for i, inst in ipairs(workspace:GetDescendants()) do
+				consider(inst)
+				if i % 4000 == 0 then
+					task.wait()
+				end
+			end
+		end
+
+		return exact or any
+	end
+
+	-- tudo que da para ler do ovo: caminho, posicao, tamanho, atributos, prompts e textos (precos!)
+	local function describeEggObject(inst, origin)
+		local lines = {}
+		local pos = eggObjectPosition(inst)
+
+		table.insert(lines, ("egg object: %s (%s)"):format(inst:GetFullName(), inst.ClassName))
+		if pos then
+			table.insert(lines, ("object position: %s | %.1f studs from you"):format(fmtVector(pos), (pos - origin).Magnitude))
+		end
+
+		local size = inst:IsA("Model") and inst:GetExtentsSize() or inst.Size
+		table.insert(lines, "object size: " .. fmtVector(size))
+
+		local attrs = {}
+		for key, value in pairs(inst:GetAttributes()) do
+			table.insert(attrs, ("%s=%s"):format(key, oneLine(fmtValue(value), 40)))
+		end
+		table.sort(attrs)
+		if #attrs > 0 then
+			table.insert(lines, "object attributes: " .. table.concat(attrs, ", "))
+		end
+
+		local interactions, texts, childAttrs = {}, {}, {}
+		for _, d in ipairs(inst:GetDescendants()) do
+			if d:IsA("ProximityPrompt") then
+				table.insert(interactions, ("ProximityPrompt %q/%q key=%s hold=%.1f range=%.1f"):format(
+					d.ActionText, d.ObjectText, d.KeyboardKeyCode.Name, d.HoldDuration, d.MaxActivationDistance
+				))
+			elseif d:IsA("ClickDetector") then
+				table.insert(interactions, ("ClickDetector range=%.1f"):format(d.MaxActivationDistance))
+			elseif (d:IsA("TextLabel") or d:IsA("TextButton")) and d.Text ~= "" and #texts < 12 then
+				table.insert(texts, ("%q"):format(oneLine(d.Text, 40)))
+			end
+
+			for key, value in pairs(d:GetAttributes()) do
+				if #childAttrs < 12 then
+					table.insert(childAttrs, ("%s.%s=%s"):format(d.Name, key, oneLine(fmtValue(value), 30)))
+				end
+			end
+		end
+		if #interactions > 0 then
+			table.insert(lines, "interaction: " .. table.concat(interactions, " | "))
+		end
+		if #texts > 0 then
+			table.insert(lines, "texts on the egg: " .. table.concat(texts, " | "))
+		end
+		if #childAttrs > 0 then
+			table.insert(lines, "child attributes: " .. table.concat(childAttrs, ", "))
+		end
+
+		local children = {}
+		for _, child in ipairs(inst:GetChildren()) do
+			if #children < 12 then
+				table.insert(children, ("%s (%s)"):format(child.Name, child.ClassName))
+			end
+		end
+		if #children > 0 then
+			table.insert(lines, "children: " .. table.concat(children, ", "))
+		end
+
+		return lines
+	end
+
+	-- bloco "local EGG_SPOTS = { ... }" com todos os ovos gravados (pronto para colar na config)
+	function Recorder.snippet()
+		local names = {}
+		for name in pairs(Recorder.Records) do
+			table.insert(names, name)
+		end
+		table.sort(names)
+
+		local out = {
+			"-- Egg spots gravados pelo recorder (cole no lugar de EGG_SPOTS, no topo do script)",
+			"local EGG_SPOTS = {",
+		}
+		for _, name in ipairs(names) do
+			local record = Recorder.Records[name]
+			for _, line in ipairs(record.Lines) do
+				table.insert(out, "\t-- " .. line)
+			end
+			table.insert(out, ("\t[%q] = %s,"):format(name, fmtVector(record.Stand)))
+			table.insert(out, "")
+		end
+		table.insert(out, "}")
+		return table.concat(out, "\n")
+	end
+
+	-- ovos que voce ja colou em EGG_SPOTS
+	for name, pos in pairs(EGG_SPOTS) do
+		if typeof(pos) == "Vector3" then
+			Recorder.Records[name] = { Name = name, Stand = pos, Lines = { "(carregado de EGG_SPOTS)" }, Count = 0 }
+		end
+	end
+
+	-- info = { Source = "remote"|"prompt"|"manual", Name = string?, Args = table.pack(...)? }
+	function Recorder.record(info)
+		local root = getRoot()
+		if not root then
+			setStatus("No character")
+			return
+		end
+
+		local stand = root.Position
+		local cframe = root.CFrame
+		local name = info.Name
+
+		-- mesmo ovo, mesmo lugar: so conta (nao repete a busca pesada)
+		local existing = name and Recorder.Records[name]
+		if existing and existing.Count > 0 and (existing.Stand - stand).Magnitude < 10 then
+			existing.Count += 1
+			setStatus(("%s opened x%d"):format(name, existing.Count))
+			return
+		end
+
+		if Recorder.Busy then
+			return
+		end
+		Recorder.Busy = true
+
+		local ok, err = pcall(function()
+			local before = numericSnapshot()
+			local inst = findEggInstance(name, stand)
+			name = name or (inst and inst.Name)
+			if not name then
+				setStatus("No egg found near you")
+				return
+			end
+
+			task.wait(Cfg.EggCurrencyWait)
+			local after = numericSnapshot()
+
+			local lines = {}
+			table.insert(lines, ("[%s] source: %s | PlaceId %d | JobId %s"):format(
+				os.date("%Y-%m-%d %H:%M:%S"), info.Source, game.PlaceId, game.JobId ~= "" and game.JobId or "-"
+			))
+
+			if info.Args then
+				local shown = {}
+				for i = 1, info.Args.n do
+					shown[i] = fmtValue(info.Args[i])
+				end
+				table.insert(lines, "FireServer args: " .. table.concat(shown, ", "))
+			end
+
+			table.insert(lines, "you stood at: " .. fmtVector(stand))
+			table.insert(lines, "your cframe: " .. fmtCFrame(cframe))
+
+			local spotLoc, spotGroup, spotDist = nearestSpot(stand)
+			if spotLoc then
+				table.insert(lines, ("nearest known spot: %s [%s], %.1f studs"):format(spotLoc.Name, spotGroup.Title, spotDist))
+			end
+
+			if inst then
+				for _, line in ipairs(describeEggObject(inst, stand)) do
+					table.insert(lines, line)
+				end
+			else
+				table.insert(lines, "egg object: not loaded in Workspace")
+			end
+
+			table.insert(lines, ("changes in %.1fs: %s"):format(Cfg.EggCurrencyWait, describeChanges(before, after)))
+
+			Recorder.Records[name] = { Name = name, Stand = stand, Lines = lines, Count = 1 }
+			Eggs.Stands[name] = stand
+			Eggs.World[name] = Eggs.World[name] or worldAt(stand)
+			Eggs.add(name)
+			Eggs.sort()
+
+			local snippet = Recorder.snippet()
+			local copied = copyText(snippet)
+			print("[SettingsGui] ovo gravado:\n" .. snippet)
+			setStatus(("%s saved%s"):format(name, copied and " + copied" or " (see F9)"))
+
+			if Recorder.OnRecorded then
+				pcall(Recorder.OnRecorded, name)
+			end
+		end)
+
+		Recorder.Busy = false
+		if not ok then
+			warn("[SettingsGui] erro ao gravar ovo:", err)
+			setStatus("Error (see F9)")
+		end
+	end
+
+	-- chamado pelo hook com os argumentos do FireServer (sem o "self")
+	local function onRemoteCall(...)
+		if not Recorder.Enabled then
+			return
+		end
+		local args = table.pack(...)
+		if args[1] ~= "PurchaseEgg" then
+			return
+		end
+		Recorder.LastRemoteAt = os.clock()
+		local name = type(args[2]) == "string" and args[2] or nil
+		spawnTask(Recorder.record, { Source = "remote", Name = name, Args = args })
+	end
+
+	-- Hook no __namecall: so repassa os argumentos do FireServer do NetworkRemoteEvent (o resto passa direto)
+	local function installHook()
+		if hookState.Installed then
+			return true
+		end
+		if not (hookmetamethod and getnamecallmethod) then
+			return false
+		end
+
+		local ok = pcall(function()
+			local original
+			local wrap = newcclosure or function(fn)
+				return fn
+			end
+			original = hookmetamethod(game, "__namecall", wrap(function(...)
+				if getnamecallmethod() == "FireServer" then
+					local handler = hookState.Handler
+					if handler then
+						local self = ...
+						if typeof(self) == "Instance" and self.Name == "NetworkRemoteEvent"
+							and not (checkcaller and checkcaller()) then
+							task.defer(handler, select(2, ...))
+						end
+					end
+				end
+				return original(...)
+			end))
+		end)
+
+		hookState.Installed = ok
+		return ok
+	end
+
+	-- Plano B (sem hook): ProximityPrompt do ovo
+	connect(ProximityPromptService.PromptTriggered, function(prompt)
+		if not Recorder.Enabled then
+			return
+		end
+
+		local name
+		local node = prompt
+		while node and node ~= workspace do
+			if Eggs.isEgg(node.Name) then
+				name = node.Name
+				break
+			end
+			node = node.Parent
+		end
+		if not name and Eggs.isEgg(prompt.ObjectText) then
+			name = prompt.ObjectText
+		end
+		if not name then
+			return
+		end
+
+		-- espera um pouco: se o hook pegar o FireServer, ele grava com os argumentos
+		local startedAt = os.clock()
+		delayTask(0.7, function()
+			if Recorder.LastRemoteAt < startedAt then
+				Recorder.record({ Source = "prompt", Name = name })
+			end
+		end)
+	end)
+
+	function Recorder.setEnabled(on)
+		Recorder.Enabled = on
+		if on then
+			if Cfg.EggRecorderUseHook and installHook() then
+				hookState.Handler = onRemoteCall
+				setStatus("Hook active - open an egg")
+			else
+				hookState.Handler = nil
+				setStatus("No hook - listening to egg prompts")
+			end
+		else
+			hookState.Handler = nil
+			setStatus("Recorder off")
+		end
+	end
+
+	-- usado pelo Kill Code: o hook (se foi instalado) fica inerte
+	function Recorder.release()
+		hookState.Handler = nil
+	end
+end
+
+---------------------------------------------------------------------
+-- LOGICA: Rejoin / Server Hop
+---------------------------------------------------------------------
+-- Obs: precisa de HTTP (game:HttpGet ou request/http_request de executor) para listar servidores,
+-- e o TeleportService nao funciona dentro do Roblox Studio (so no jogo real).
+local Server = { Busy = false }
+
+do
+	local function httpGet(url)
+		local ok, body = pcall(function()
+			return game:HttpGet(url)
+		end)
+		if ok and type(body) == "string" and #body > 0 then
+			return body
+		end
+
+		local req = (syn and syn.request) or http_request or request
+		if req then
+			local ok2, res = pcall(req, { Url = url, Method = "GET" })
+			if ok2 and type(res) == "table" and res.Body then
+				return res.Body
+			end
+		end
+		return nil
+	end
+
+	-- sortOrder "Desc" = servidores mais cheios primeiro, "Asc" = mais vazios primeiro
+	local function findServer(sortOrder, onlyEmptiest)
+		local url = ("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=%s&excludeFullGames=true&limit=100")
+			:format(game.PlaceId, sortOrder)
+
+		local body = httpGet(url)
+		if not body then
+			return nil
+		end
+
+		local ok, data = pcall(function()
+			return HttpService:JSONDecode(body)
+		end)
+		if not ok or type(data) ~= "table" or type(data.data) ~= "table" then
+			return nil
+		end
+
+		local candidates = {}
+		for _, server in ipairs(data.data) do
+			if server.id ~= game.JobId
+				and type(server.playing) == "number"
+				and type(server.maxPlayers) == "number"
+				and server.playing < server.maxPlayers then
+				table.insert(candidates, server)
+			end
+		end
+		if #candidates == 0 then
+			return nil
+		end
+
+		-- nos mais vazios, sorteia entre os 5 primeiros (evita todo mundo cair no mesmo servidor)
+		local limit = onlyEmptiest and math.min(#candidates, 5) or #candidates
+		return candidates[math.random(1, limit)]
+	end
+
+	-- handle = retorno do addButton
+	function Server.hop(handle, idleText, sortOrder, onlyEmptiest)
+		if Server.Busy then
+			return
+		end
+		Server.Busy = true
+		handle.SetText("Wait...")
+
+		local server = findServer(sortOrder, onlyEmptiest)
+		if server then
+			local ok = pcall(function()
+				TeleportService:TeleportToPlaceInstance(game.PlaceId, server.id, player)
+			end)
+			if ok then
+				-- se o teleporte falhar, libera o botao de novo depois de um tempo
+				delayTask(10, function()
+					Server.Busy = false
+					handle.SetText(idleText)
+				end)
+				return
+			end
+		end
+
+		handle.SetText("Failed")
+		task.wait(2)
+		handle.SetText(idleText)
+		Server.Busy = false
+	end
+
+	function Server.rejoin(handle)
+		if Server.Busy then
+			return
+		end
+		Server.Busy = true
+		handle.SetText("Wait...")
+
+		local ok = pcall(function()
+			if #Players:GetPlayers() <= 1 then
+				-- sozinho no servidor: teleporta para o mesmo lugar (cai num servidor novo)
+				TeleportService:Teleport(game.PlaceId, player)
+			else
+				TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId, player)
+			end
+		end)
+
+		if not ok then
+			handle.SetText("Failed")
+			task.wait(2)
+		else
+			task.wait(10)
+		end
+		handle.SetText("Rejoin")
+		Server.Busy = false
+	end
+end
+
+---------------------------------------------------------------------
+-- LOGICA: Anti AFK
+---------------------------------------------------------------------
+-- O Roblox desconecta quem fica ~20 min sem nenhuma entrada. Quando o evento Idled dispara, respondemos com
+-- um clique virtual (VirtualUser), que conta como atividade e evita o desconectar por inatividade.
+-- Obs: isso cobre o kick por inatividade do proprio Roblox; um sistema de AFK proprio do jogo pode ser diferente.
+local AntiAfk = { Connection = nil }
+
+function AntiAfk.set(on)
+	if on and not AntiAfk.Connection then
+		AntiAfk.Connection = connect(player.Idled, function()
+			local ok, err = pcall(function()
+				local virtualUser = game:GetService("VirtualUser")
+				virtualUser:CaptureController()
+				virtualUser:ClickButton2(Vector2.new())
+			end)
+			if debugEnabled then
+				print("[SettingsGui] Anti AFK:", ok and "clique virtual enviado" or tostring(err))
+			end
+		end)
+	elseif not on and AntiAfk.Connection then
+		AntiAfk.Connection:Disconnect()
+		AntiAfk.Connection = nil
+	end
+end
+
+---------------------------------------------------------------------
+-- KILL CODE: desconecta tudo, cancela todas as threads e remove a GUI
+---------------------------------------------------------------------
+local function killCode()
+	if not alive then
+		return
+	end
+	alive = false
+
+	for _, connection in ipairs(connections) do
+		connection:Disconnect()
+	end
+	table.clear(connections)
+
+	local current = coroutine.running()
+	for _, thread in ipairs(threads) do
+		if thread ~= current and coroutine.status(thread) ~= "dead" then
+			pcall(task.cancel, thread)
+		end
+	end
+	table.clear(threads)
+	Chests.Thread = nil
+
+	Recorder.release()
+	player:SetAttribute("Debug", nil)
+	if _G.SettingsGuiKill == killCode then
+		_G.SettingsGuiKill = nil
+	end
+	gui:Destroy()
+end
+
+_G.SettingsGuiKill = killCode
+
+---------------------------------------------------------------------
+-- ABA: AUTOFARM
+---------------------------------------------------------------------
+local autofarmPage = newTab("Autofarm")
+
+local bubbleGroup = addGroup(autofarmPage, "Bubbles", { Open = true, Key = "autofarm/bubbles" })
+
+addToggle(bubbleGroup.Body, "Blow Bubble", "Fires BlowBubble repeatedly", false, function(on)
+	blowBubble.Loop.Set(on)
+end, "bubbles.on")
+
+addSlider(bubbleGroup.Body, "Blow Bubble delay", "Seconds between bubbles", 0.05, 2, Cfg.BlowBubbleDelay, function(v)
+	blowBubble.Delay = v
+end, 0.05, "bubbles.delay")
+
+local chestGroup = addGroup(autofarmPage, "Baús", { Open = true, Key = "autofarm/chests" })
+
+local COLLECT_DESC = "Saves start pos, equips by world, returns at end"
+local AUTO_COLLECT_DESC = "Repeats the collection when chests are ready"
+local collectButton
+local autoCollectToggle
+local autoCollectThread
+local autoOwnsRun = false -- a coleta em andamento foi iniciada pelo AutoCollect?
+
+local function resetCollectUi()
+	collectButton.SetText("Collect")
+	collectButton.SetDesc(COLLECT_DESC)
+end
+
+collectButton = addButton(chestGroup.Body, "Collect all chests", COLLECT_DESC, "Collect", function()
+	-- clicou de novo enquanto roda: para na hora e retorna ao inicio
+	if Chests.Thread then
+		Chests.stop()
+		resetCollectUi()
+		return
+	end
+
+	collectButton.SetText("Stop")
+	Chests.start(collectButton.SetDesc, function(summary)
+		collectButton.SetText("Collect")
+		collectButton.SetDesc(summary)
+	end)
+end)
+
+-- AutoCollect Chest: roda a coleta, espera o proximo bau ficar pronto (timers conhecidos) e repete.
+-- O Auto Hatch e o Blow Bubble se pausam enquanto a coleta roda, e voce volta para a posicao inicial no fim.
+local function setAutoCollect(on)
+	if on and not autoCollectThread then
+		autoCollectThread = spawnTask(function()
+			while alive do
+				-- nunca roda duas coletas juntas: espera uma coleta manual terminar
+				while Chests.Thread do
+					task.wait(0.5)
+				end
+
+				autoOwnsRun = true
+				collectButton.SetText("Stop")
+				Chests.start(collectButton.SetDesc, function(summary)
+					collectButton.SetText("Collect")
+					collectButton.SetDesc(summary)
+				end)
+				while Chests.Thread do
+					task.wait(0.5)
+				end
+				autoOwnsRun = false
+
+				-- espera o proximo bau ficar pronto (com folga), entre o minimo e o maximo configurados
+				local secs = Chests.nextReady()
+				local waitTime = secs and (secs + Cfg.AutoCollectMargin) or Cfg.AutoCollectRetry
+				waitTime = math.clamp(waitTime, Cfg.AutoCollectMinWait, Cfg.AutoCollectMaxWait)
+
+				local untilTime = os.clock() + waitTime
+				repeat
+					autoCollectToggle.SetDesc(("Next run in %s"):format(Chests.fmtTime(untilTime - os.clock())))
+					task.wait(1)
+				until os.clock() >= untilTime
+			end
+		end)
+	elseif not on and autoCollectThread then
+		pcall(task.cancel, autoCollectThread)
+		autoCollectThread = nil
+		autoCollectToggle.SetDesc(AUTO_COLLECT_DESC)
+
+		-- desligou no meio de uma coleta que ele mesmo iniciou: para e volta para a posicao inicial
+		if autoOwnsRun and Chests.Thread then
+			autoOwnsRun = false
+			Chests.stop()
+			resetCollectUi()
+		end
+	end
+end
+
+autoCollectToggle = addToggle(chestGroup.Body, "AutoCollect Chest", AUTO_COLLECT_DESC, false, setAutoCollect, "chests.auto")
+
+local timersButton
+timersButton = addButton(chestGroup.Body, "Chest timers", "Shows when the next chest is ready", "Check", function()
+	timersButton.SetDesc(Chests.checkTimers())
+end)
+
+local teamGroup = addGroup(autofarmPage, "Equipes", { Open = true, Key = "autofarm/teams" })
+
+addToggle(teamGroup.Body, "Auto equip teams", "Equips the right team per world during chests", Cfg.AutoEquipTeams, function(on)
+	Cfg.AutoEquipTeams = on
+	Teams.LastSlot = nil
+end, "teams.auto")
+
+addSlider(teamGroup.Body, "Lobby / Spawn team", "Team slot for Lobby", 1, 9, Cfg.LobbyTeam, function(v)
+	Cfg.LobbyTeam = v
+	Teams.LastSlot = nil
+end, 1, "teams.lobby")
+
+addSlider(teamGroup.Body, "Other worlds team", "Team slot for other worlds", 1, 9, Cfg.DefaultWorldTeam, function(v)
+	Cfg.DefaultWorldTeam = v
+	Teams.LastSlot = nil
+end, 1, "teams.world")
+
+addSlider(teamGroup.Body, "Céu team", "Team slot for Céu world", 1, 9, Cfg.SkyWorldTeam, function(v)
+	Cfg.SkyWorldTeam = v
+	Teams.LastSlot = nil
+end, 1, "teams.sky")
+
+---------------------------------------------------------------------
+-- ABA: OVOS
+---------------------------------------------------------------------
+local eggPage = newTab("Ovos")
+
+local hatchGroup = addGroup(eggPage, "Auto Hatch", { Open = true, Key = "ovos/hatch" })
+
+local selectedRow = baseRow(hatchGroup.Body, "Selected egg", Eggs.Selected, 20)
+
+addToggle(hatchGroup.Body, "Auto Hatch", "Buys the selected egg repeatedly", false, function(on)
+	Eggs.Loop.Set(on)
+end, "hatch.on")
+
+addSlider(hatchGroup.Body, "Hatch delay", "Seconds between purchases", 0.1, 3, Cfg.HatchDelay, function(v)
+	Eggs.Delay = v
+end, 0.1, "hatch.delay")
+
+local recorderGroup = addGroup(eggPage, "Egg recorder", { Open = false, Key = "ovos/recorder" })
+
+local recorderToggle
+Recorder.OnStatus = function(text)
+	if recorderToggle then
+		recorderToggle.SetDesc(text)
+	end
+end
+
+recorderToggle = addToggle(recorderGroup.Body, "Record eggs", "Saves where you open an egg and copies it", true, function(on)
+	Recorder.setEnabled(on)
+end, "recorder.on")
+
+addButton(recorderGroup.Body, "Mark egg here", "Saves the nearest egg and your spot", "Mark", function()
+	Recorder.record({ Source = "manual" })
+end)
+
+local copySpotsButton
+copySpotsButton = addButton(recorderGroup.Body, "Copy egg spots", "Copies every saved egg spot", "Copy", function()
+	local snippet = Recorder.snippet()
+	local copied = copyText(snippet)
+	copySpotsButton.SetText(copied and "Copied!" or "See F9")
+	if not copied then
+		print(snippet)
+	end
+	delayTask(2, function()
+		copySpotsButton.SetText("Copy")
+	end)
+end)
+
+-- "Ovos teleportes": um grupo que abre/fecha com um subgrupo por mundo e um botao "Go" por ovo/caixa
+local eggTeleportGroup = addGroup(eggPage, "Ovos teleportes", { Open = false, Key = "ovos/teleportes" })
+local eggTeleportGroups = {}
+
+-- lista de ovos: um grupo por mundo (ovos primeiro, depois as caixas), do mais barato ao mais caro
+local eggGroups = {}
+local eggButtons = {}
+
+local function eggDesc(name)
+	local parts = {}
+	if Eggs.Price[name] then
+		table.insert(parts, Eggs.Price[name])
+	end
+	if Eggs.Stands[name] then
+		table.insert(parts, "spot saved")
+	end
+	if #parts == 0 then
+		return nil
+	end
+	return table.concat(parts, " | ")
+end
+
+local function refreshEggButtons()
+	for name, handle in pairs(eggButtons) do
+		local selected = name == Eggs.Selected
+		handle.SetText(selected and "Selected" or "Select")
+		handle.SetStyle(
+			selected and THEME.On or THEME.TabIdle,
+			selected and THEME.OnBorder or THEME.PanelBorder
+		)
+	end
+
+	local price = Eggs.Price[Eggs.Selected]
+	setRowDesc(selectedRow, price and (Eggs.Selected .. " | " .. price) or Eggs.Selected)
+end
+
+-- ordem dos mundos (a mesma do Teleport; o que nao tem mundo vai em "Other")
+local function eggWorldOrder()
+	local order = {}
+	for _, group in ipairs(TELEPORT_GROUPS) do
+		table.insert(order, group.Title)
+	end
+	table.insert(order, "Other")
+	return order
+end
+
+-- ovos e caixas de um mundo, na ordem de preco de Eggs.Names
+local function eggsOfWorld(worldTitle)
+	local eggs, crates = {}, {}
+	for _, name in ipairs(Eggs.Names) do
+		if (Eggs.World[name] or "Other") == worldTitle then
+			table.insert(Eggs.isCrate(name) and crates or eggs, name)
+		end
+	end
+	return eggs, crates
+end
+
+local function rebuildEggTeleports()
+	for _, group in ipairs(eggTeleportGroups) do
+		group.Destroy()
+	end
+	table.clear(eggTeleportGroups)
+
+	for _, worldTitle in ipairs(eggWorldOrder()) do
+		local eggs, crates = eggsOfWorld(worldTitle)
+		local total = #eggs + #crates
+		if total > 0 then
+			local group = addGroup(
+				eggTeleportGroup.Body,
+				("%s (%d)"):format(worldTitle, total),
+				{ Key = "ovos-tp/" .. worldTitle }
+			)
+			table.insert(eggTeleportGroups, group)
+
+			local function addRows(names)
+				for _, name in ipairs(names) do
+					addButton(group.Body, name, Eggs.Price[name], "Go", function()
+						Eggs.goTo(name)
+					end)
+				end
+			end
+
+			addRows(eggs)
+			if #crates > 0 then
+				addSection(group.Body, "Caixas")
+				addRows(crates)
+			end
+		end
+	end
+end
+
+-- recria as listas (depois de gravar um ovo); os grupos lembram se estavam abertos (pela Key)
+local function rebuildEggList()
+	for _, group in ipairs(eggGroups) do
+		group.Destroy()
+	end
+	table.clear(eggGroups)
+	table.clear(eggButtons)
+
+	for _, worldTitle in ipairs(eggWorldOrder()) do
+		local eggs, crates = eggsOfWorld(worldTitle)
+		local total = #eggs + #crates
+		if total > 0 then
+			local group = addGroup(eggPage, ("%s (%d)"):format(worldTitle, total), { Key = "ovos/" .. worldTitle })
+			table.insert(eggGroups, group)
+
+			local function addRows(names)
+				for _, name in ipairs(names) do
+					eggButtons[name] = addButton(group.Body, name, eggDesc(name), "Select", function()
+						Eggs.Selected = name
+						refreshEggButtons()
+					end)
+				end
+			end
+
+			addRows(eggs)
+			if #crates > 0 then
+				addSection(group.Body, "Caixas")
+				addRows(crates)
+			end
+		end
+	end
+
+	refreshEggButtons()
+	rebuildEggTeleports()
+end
+
+Recorder.OnRecorded = function()
+	rebuildEggList()
+end
+
+rebuildEggList()
+
+-- o recorder comeca ligado (igual ao toggle)
+Recorder.setEnabled(true)
+
+---------------------------------------------------------------------
+-- SALVAR CONFIGURACAO
+---------------------------------------------------------------------
+-- Grava os controles que tem "chave" (toggles/sliders), o ovo escolhido e quais grupos estao abertos.
+-- Precisa de writefile/readfile (executor). Ao executar de novo, a configuracao e carregada sozinha
+-- (Cfg.AutoLoadConfig) e aplicada no fim do script.
+function Settings.collect()
+	local data = { Version = 1, Controls = {}, Groups = {}, Egg = Eggs.Selected }
+	for key, control in pairs(Settings.Controls) do
+		data.Controls[key] = control.Handle.Get()
+	end
+	for key, open in pairs(groupOpenState) do
+		data.Groups[key] = open
+	end
+	return data
+end
+
+-- retorna true, caminho  |  false, motivo
+function Settings.save()
+	if not Settings.supported() then
+		return false, "executor sem writefile/readfile"
+	end
+	local path = Settings.path()
+	local ok, err = pcall(function()
+		writefile(path, HttpService:JSONEncode(Settings.collect()))
+	end)
+	if not ok then
+		return false, tostring(err)
+	end
+	return true, path
+end
+
+-- aplica a configuracao carregada: ovo escolhido -> sliders -> toggles (assim os loops ja ligam com os valores certos)
+function Settings.apply()
+	local data = Settings.Data
+	if type(data) ~= "table" or type(data.Controls) ~= "table" then
+		return false
+	end
+
+	if type(data.Egg) == "string" and table.find(Eggs.Names, data.Egg) then
+		Eggs.Selected = data.Egg
+		refreshEggButtons()
+	end
+
+	for _, kind in ipairs({ "slider", "toggle" }) do
+		for key, control in pairs(Settings.Controls) do
+			local value = data.Controls[key]
+			if control.Kind == kind and type(value) == (kind == "slider" and "number" or "boolean") then
+				control.Handle.Set(value)
+			end
+		end
+	end
+
+	print("[SettingsGui] Configuracao carregada de " .. Settings.path())
+	return true
+end
+
+---------------------------------------------------------------------
+-- ABA: CLIENTE
+---------------------------------------------------------------------
+local clientPage = newTab("Cliente")
+
+local charGroup = addGroup(clientPage, "Personagem", { Open = true, Key = "cliente/char" })
+
+local walkSpeedSlider = addSlider(charGroup.Body, "Walk Speed", "How fast your character runs", 16, 100, Cfg.DefaultWalkSpeed, function(v)
+	saved.WalkSpeed = v
+	local hum = getHumanoid()
+	if hum then
+		hum.WalkSpeed = v
+	end
+end, nil, "char.walkSpeed")
+
+local jumpPowerSlider = addSlider(charGroup.Body, "Jump Power", "How high your character jumps", 50, 200, Cfg.DefaultJumpPower, function(v)
+	saved.JumpPower = v
+	local hum = getHumanoid()
+	if hum then
+		hum.UseJumpPower = true
+		hum.JumpPower = v
+	end
+end, nil, "char.jumpPower")
+
+local resetCharButton
+resetCharButton = addButton(
+	charGroup.Body,
+	"Retornar para configuração padrão",
+	("Restaura Walk Speed (%d) e Jump Power (%d)"):format(Cfg.DefaultWalkSpeed, Cfg.DefaultJumpPower),
+	"Reset",
+	function()
+		saved.WalkSpeed = nil
+		saved.JumpPower = nil
+
+		walkSpeedSlider.Set(Cfg.DefaultWalkSpeed, true)
+		jumpPowerSlider.Set(Cfg.DefaultJumpPower, true)
+
+		local hum = getHumanoid()
+		if hum then
+			hum.WalkSpeed = Cfg.DefaultWalkSpeed
+			hum.UseJumpPower = true
+			hum.JumpPower = Cfg.DefaultJumpPower
+		end
+
+		resetCharButton.SetText("Done!")
+		delayTask(1.2, function()
+			resetCharButton.SetText("Reset")
+		end)
+	end
+)
+
+-- (a antiga secao "Camera" foi removida: o Field of View agora fica em Ferramentas)
+local toolsGroup = addGroup(clientPage, "Ferramentas", { Open = false, Key = "cliente/tools" })
+
+local startFov = workspace.CurrentCamera and math.round(workspace.CurrentCamera.FieldOfView) or 70
+
+addSlider(toolsGroup.Body, "Field of View", "How wide your camera sees", 40, 120, startFov, function(v)
+	local camera = workspace.CurrentCamera -- lido na hora: o jogo pode trocar a camera
+	if camera then
+		camera.FieldOfView = v
+	end
+end, nil, "tools.fov")
+
+addToggle(toolsGroup.Body, "Debug", nil, false, function(on)
+	debugEnabled = on
+	player:SetAttribute("Debug", on)
+	print("[SettingsGui] Debug:", on)
+end, "tools.debug")
+
+local copyPositionButton
+copyPositionButton = addButton(toolsGroup.Body, "Copy Position", "Copies your current Vector3.new(...)", "Copy", function()
+	local root = getRoot()
+	if not root then
+		return
+	end
+
+	local pos = root.Position
+	local formatted = string.format("Vector3.new(%.4f, %.4f, %.4f)", pos.X, pos.Y, pos.Z)
+
+	if copyText(formatted) then
+		copyPositionButton.SetText("Copied!")
+	else
+		print("[SettingsGui] Position:", formatted)
+		copyPositionButton.SetText("See F9")
+	end
+
+	delayTask(2, function()
+		copyPositionButton.SetText("Copy")
+	end)
+end)
+
+local serverGroup = addGroup(clientPage, "Servidor", { Open = false, Key = "cliente/server" })
+
+local rejoinButton, hopButton, smallHopButton
+
+rejoinButton = addButton(serverGroup.Body, "Rejoin", "Reconnects you to this server", "Rejoin", function()
+	Server.rejoin(rejoinButton)
+end)
+
+hopButton = addButton(serverGroup.Body, "Server Hop", "Joins a different public server", "Hop", function()
+	Server.hop(hopButton, "Hop", "Desc", false)
+end)
+
+smallHopButton = addButton(serverGroup.Body, "Small Server Hop", "Joins one of the emptiest servers", "Hop", function()
+	Server.hop(smallHopButton, "Hop", "Asc", true)
+end)
+
+local scriptGroup = addGroup(clientPage, "Script", { Open = false, Key = "cliente/script" })
+
+-- comeca ligado (script de farm fica AFK); a configuracao salva pode desligar
+addToggle(scriptGroup.Body, "Anti AFK", "Prevents the idle disconnect while you are away", true, function(on)
+	AntiAfk.set(on)
+end, "script.antiafk")
+AntiAfk.set(true)
+
+local SAVE_DESC = "Saves your settings; loaded again on next run"
+local saveButton
+saveButton = addButton(scriptGroup.Body, "Salvar Configuração", SAVE_DESC, "Save", function()
+	local ok, info = Settings.save()
+	saveButton.SetText(ok and "Saved!" or "Failed")
+	saveButton.SetDesc(ok and ("Saved to " .. info) or ("Could not save: " .. info))
+	delayTask(3, function()
+		saveButton.SetText("Save")
+		saveButton.SetDesc(SAVE_DESC)
+	end)
+end)
+
+local killButton = addButton(scriptGroup.Body, "Kill Code", "Stops everything and removes the GUI", "Kill", function()
+	killCode()
+end)
+killButton.SetStyle(THEME.Close, THEME.CloseBorder) -- botao vermelho
+
+---------------------------------------------------------------------
+-- ABA: TELEPORT (um grupo por mundo: clique no nome do mundo para abrir/fechar)
+---------------------------------------------------------------------
+local teleportPage = newTab("Teleport")
+
+addExpandControls(teleportPage)
+
+for _, group in ipairs(TELEPORT_GROUPS) do
+	local worldGroup = addGroup(
+		teleportPage,
+		("%s (%d)"):format(group.Title, #group.Locations),
+		{ Key = "teleport/" .. group.Title } -- comeca fechado
+	)
+	for _, loc in ipairs(group.Locations) do
+		addButton(worldGroup.Body, loc.Name, nil, "Go", function()
+			teleportTo(loc.Pos)
+		end)
+	end
+end
+
+---------------------------------------------------------------------
+-- ABRIR / FECHAR A JANELA
+---------------------------------------------------------------------
+local isOpen = false
+
+local function fitScale()
+	local viewport = gui.AbsoluteSize
+	return math.clamp(math.min(viewport.X / 640, viewport.Y / 520), 0.5, 1)
+end
+
+local function setOpen(open)
+	isOpen = open
+	if open then
+		uiScale.Scale = fitScale() * 0.6
+		window.Visible = true
+		TweenService:Create(uiScale, TweenInfo.new(0.25, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {
+			Scale = fitScale(),
+		}):Play()
+	else
+		local tween = TweenService:Create(uiScale, TweenInfo.new(0.15, Enum.EasingStyle.Quad, Enum.EasingDirection.In), {
+			Scale = fitScale() * 0.6,
+		})
+		tween.Completed:Connect(function()
+			if not isOpen then
+				window.Visible = false
+			end
+		end)
+		tween:Play()
+	end
+end
+
+openButton.Activated:Connect(function()
+	setOpen(not isOpen)
+end)
+
+closeButton.Activated:Connect(function()
+	setOpen(false)
+end)
+
+connect(gui:GetPropertyChangedSignal("AbsoluteSize"), function()
+	if isOpen then
+		uiScale.Scale = fitScale()
+	end
+end)
+
+-- aplica a configuracao salva (se existir)
+if Cfg.AutoLoadConfig and Settings.Data then
+	local ok, err = pcall(Settings.apply)
+	if not ok then
+		warn("[SettingsGui] erro ao aplicar a configuracao salva:", err)
+	end
+end
+
+mountGui(gui)
+selectTab("Autofarm")
+setOpen(true)
